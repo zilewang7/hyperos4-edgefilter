@@ -17,11 +17,11 @@ jobs:
       - name: Set up Android NDK
         uses: android-actions/setup-android@v3
         with:
-          packages: 'ndk;26.1.10909125'
+          packages: 'ndk;21.2.6472646'
 
       - name: Build module zip
         env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/21.2.6472646
         run: |
           chmod +x build.sh
           ./build.sh

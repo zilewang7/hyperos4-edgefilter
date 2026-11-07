@@ -17,9 +17,10 @@
   .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
   .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
   .dot.off{background:var(--bad)}
-  main{display:grid;grid-template-columns:minmax(320px,1.4fr) minmax(300px,1fr);gap:16px;padding:16px;align-items:start}
+  main{display:grid;grid-template-columns:minmax(320px,1.4fr) minmax(300px,1fr);gap:16px;padding:16px;align-items:stretch}
   @media(max-width:900px){main{grid-template-columns:1fr}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;min-width:0}
+  .canvas-wrap{flex:1;display:flex;align-items:center;min-height:0}
   .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
   .grp{margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)}
   .grp:first-of-type{margin-top:0;padding-top:0;border-top:none}
@@ -61,7 +62,7 @@
 <main>
   <section class="card">
     <h2>实时判定</h2>
-    <canvas id="cv"></canvas>
+    <div class="canvas-wrap"><canvas id="cv"></canvas></div>
     <div class="meta">
       <span>绿点 <b>放行</b></span>
       <span style="color:#ff9f7b">橙点 <b>握持拦截</b></span>
