@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EdgeFilter 控制台</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#21262d; --fg:#c9d1d9; --dim:#8b949e;
+    --ok:#3fb950; --bad:#f85149; --accent:#58a6ff; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+  header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.5px}
+  .pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px;border-radius:999px;background:#0d1117;border:1px solid var(--line);font-size:12px;color:var(--dim)}
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .dot.off{background:var(--bad)}
+  main{display:grid;grid-template-columns:minmax(320px,1.4fr) minmax(300px,1fr);gap:16px;padding:16px;align-items:start}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+  .grp{margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)}
+  .grp:first-of-type{margin-top:0;padding-top:0;border-top:none}
+  .grp h3{font-size:12px;margin:0 0 8px;font-weight:600;color:var(--fg);display:flex;align-items:center;gap:6px}
+  .sw{width:10px;height:10px;border-radius:2px;flex:none}
+  .sw.core{background:rgba(248,81,73,.75)}
+  .sw.band{background:rgba(248,81,73,.22);border:1px solid rgba(248,81,73,.55)}
+  canvas{width:100%;display:block;border-radius:8px;background:#010409}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 4px}
+  .row label{color:var(--dim);font-size:13px}
+  .row .val{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600;min-width:52px;text-align:right}
+  input[type=range]{width:100%;accent-color:var(--accent);margin:0}
+  .btns{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
+  button{flex:1;min-width:88px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:#21262d;color:var(--fg);cursor:pointer;font-size:13px}
+  button:hover{border-color:#30363d;background:#262c36}
+  button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+  button.primary:hover{background:#2f81f7}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+  th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  td.ok{color:var(--ok)} td.bad{color:var(--bad)} td.core{color:#ff7b72;font-weight:600}
+  .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:10px}
+  .meta b{color:var(--fg);font-weight:600}
+  #toast{position:fixed;right:18px;bottom:18px;background:#21262d;border:1px solid var(--line);padding:10px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;font-size:13px}
+  #toast.show{opacity:1}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>EdgeFilter</h1>
+  <span class="pill"><span id="dot" class="dot"></span><span id="state">连接中…</span></span>
+  <span class="pill" id="devpill">device: —</span>
+  <span class="pill" id="rotpill">rot: —</span>
+  <span class="pill" id="pidpill">pid: —</span>
+  <span class="pill" id="modepill">—</span>
+</header>
+
+<main>
+  <section class="card">
+    <h2>实时判定</h2>
+    <canvas id="cv"></canvas>
+    <div class="meta">
+      <span>绿点 <b>放行</b></span>
+      <span style="color:#ff9f7b">橙点 <b>握持拦截</b></span>
+      <span style="color:#ff7b72">红点 <b>核心带拦截</b></span>
+    </div>
+    <div class="hint">点按起手坐标绘制，3 秒后淡出。只显示每个触点的「起手点」判定。</div>
+  </section>
+
+  <section class="card">
+    <h2>参数</h2>
+
+    <div class="grp">
+      <h3><span class="sw core"></span>核心带 —— 落点在这里一律拦截</h3>
+      <div class="hint" style="margin-top:0;margin-bottom:8px">不看接触面积，贴边的那一小条直接用。</div>
+      <div class="row"><label>核心 左</label><span class="val"><span id="vCL">40</span> px</span></div>
+      <input type="range" id="sCL" min="0" max="400" step="5" value="40">
+      <div class="row"><label>核心 右</label><span class="val"><span id="vCR">40</span> px</span></div>
+      <input type="range" id="sCR" min="0" max="400" step="5" value="40">
+      <div class="row"><label>核心 上</label><span class="val"><span id="vCT">0</span> px</span></div>
+      <input type="range" id="sCT" min="0" max="400" step="5" value="0">
+      <div class="row"><label>核心 下</label><span class="val"><span id="vCB">0</span> px</span></div>
+      <input type="range" id="sCB" min="0" max="400" step="5" value="0">
+    </div>
+
+    <div class="grp">
+      <h3><span class="sw band"></span>外层边缘带 —— 拦贴边握持</h3>
+      <div class="row"><label>左边缘带</label><span class="val"><span id="vL">150</span> px</span></div>
+      <input type="range" id="sL" min="0" max="400" step="10" value="150">
+      <div class="row"><label>右边缘带</label><span class="val"><span id="vR">150</span> px</span></div>
+      <input type="range" id="sR" min="0" max="400" step="10" value="150">
+      <div class="row"><label>上边缘带</label><span class="val"><span id="vT">0</span> px</span></div>
+      <input type="range" id="sT" min="0" max="400" step="10" value="0">
+      <div class="row"><label>下边缘带</label><span class="val"><span id="vB">0</span> px</span></div>
+      <input type="range" id="sB" min="0" max="400" step="10" value="0">
+
+      <div class="row"><label>握持阈值 MAJOR</label><span class="val"><span id="vM">80</span></span></div>
+      <input type="range" id="sM" min="0" max="300" step="5" value="80">
+      <div class="hint" id="mhint">边缘带内接触面积 ≥ 这个值就拦掉。实测：指尖 12~36，拇指贴着边框握持 40~76。</div>
+    </div>
+
+    <div class="btns">
+      <button class="primary" id="apply">应用并重启</button>
+      <button id="reset">还原</button>
+      <button id="stop">停止</button>
+      <button id="start">启动</button>
+    </div>
+    <div class="hint" id="dirty" style="display:none;color:var(--warn)">有未应用的改动</div>
+  </section>
+
+  <section class="card" style="grid-column:1/-1">
+    <h2>最近判定</h2>
+    <table>
+      <thead><tr><th>时间</th><th>slot</th><th>x</th><th>y</th><th>major</th><th>结果</th><th>原因</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const RE = /slot (\d+) (?:new contact|core swipe|core tap) at \((-?\d+),(-?\d+)\) major=(\d+) -> (BLOCKED|pass)(?: (\w+))?/;
+
+let st = {running:false, panel:{x:21359,y:31999}, rot:90, log_lines:0, config:{}};
+let points = [];          // {sx,sy,kind,t}
+let since = 0;
+let ready = false;        // 拿到首帧 status 之后才开始拉事件
+let token = '';
+try { token = localStorage.getItem('ef_token') || ''; } catch(e) {}
+
+const KSU = (typeof ksu !== 'undefined' && typeof ksu.exec === 'function');
+const API_SH = '/data/adb/modules/edgefilter/api.sh';
+
+/* 兼容不同 KSU 版本的返回值（string / {errno,stdout,stderr}） */
+function ksuExec(cmd){
+  return Promise.resolve(ksu.exec(cmd)).then(r=>{
+    if (typeof r === 'string') return r;
+    if (r && r.errno && r.errno !== 0) throw new Error(r.stderr || 'exec error');
+    return (r && r.stdout) || '';
+  });
+}
+
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), 1800);
+}
+
+function api(params, method='GET'){
+  const q = new URLSearchParams(params);
+  if (token) q.set('token', token);
+  const qs = q.toString();
+  if (KSU){
+    return ksuExec(API_SH + " '" + qs + "'").then(out => JSON.parse(out || '{}'));
+  }
+  return fetch('/cgi-bin/api?' + qs, {method, cache:'no-store'}).then(r=>r.json());
+}
+
+/* ---------- coordinate mapping: raw panel -> screen ---------- */
+function screenSize(){
+  const r = st.rot % 360;
+  return (r === 90 || r === 270)
+    ? {w: st.panel.y, h: st.panel.x}
+    : {w: st.panel.x, h: st.panel.y};
+}
+function toScreen(x, y){
+  const r = st.rot % 360, P = st.panel;
+  switch(r){
+    case 0:   return {sx: x,       sy: y};
+    case 90:  return {sx: y,       sy: P.x - x};
+    case 180: return {sx: P.x - x, sy: P.y - y};
+    default:  return {sx: P.y - y, sy: x};
+  }
+}
+
+/* ---------- canvas ---------- */
+const cv = $('cv'), ctx = cv.getContext('2d');
+const bgc = document.createElement('canvas'), bgx = bgc.getContext('2d');
+let cssW = 0, cssH = 0, bgDirty = true, rafId = 0;
+
+function resize(){
+  const w = cv.clientWidth || 600;
+  const s = screenSize();
+  const h = Math.round(w * s.h / s.w);
+  const dpr = window.devicePixelRatio || 1;
+  cv.style.height = h + 'px';
+  cv.width = Math.round(w * dpr);
+  cv.height = Math.round(h * dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  cssW = w; cssH = h;
+  bgDirty = true;
+}
+
+function cfgVals(){
+  const L = +$('sL').value, R = +$('sR').value, T = +$('sT').value, B = +$('sB').value;
+  // 核心带必须在外层带以内，否则语义会变得很奇怪
+  const clamp = (c, b) => b > 0 ? Math.min(c, b) : 0;
+  return {
+    L, R, T, B,
+    CL: clamp(+$('sCL').value, L), CR: clamp(+$('sCR').value, R),
+    CT: clamp(+$('sCT').value, T), CB: clamp(+$('sCB').value, B),
+    M: +$('sM').value
+  };
+}
+
+/* 静态背景（屏幕 + 两层边缘带）只在参数变化时重画一次 */
+function renderBg(){
+  const s = screenSize();
+  const k = cssW / s.w;
+  const unit = (st.config && st.config.scale) || 10;
+  const cfg = cfgVals();
+  const dpr = window.devicePixelRatio || 1;
+
+  bgc.width = Math.round(cssW * dpr);
+  bgc.height = Math.round(cssH * dpr);
+  bgx.setTransform(dpr,0,0,dpr,0,0);
+
+  bgx.clearRect(0,0,cssW,cssH);
+  bgx.fillStyle = '#0b1220';
+  bgx.fillRect(0,0,cssW,cssH);
+  bgx.strokeStyle = '#30363d';
+  bgx.lineWidth = 1;
+  bgx.strokeRect(0.5,0.5,cssW-1,cssH-1);
+
+  const bands = (l,r,t,b) => [
+    [0, 0, l*unit*k, cssH],
+    [cssW - r*unit*k, 0, r*unit*k, cssH],
+    [0, 0, cssW, t*unit*k],
+    [0, cssH - b*unit*k, cssW, b*unit*k]
+  ];
+
+  // 外层带
+  bgx.fillStyle = 'rgba(248,81,73,.14)';
+  bgx.strokeStyle = 'rgba(248,81,73,.45)';
+  for (const [x,y,w,h] of bands(cfg.L, cfg.R, cfg.T, cfg.B)){
+    if (w <= 0 || h <= 0) continue;
+    bgx.fillRect(x,y,w,h);
+    bgx.strokeRect(x+0.5,y+0.5,w-1,h-1);
+  }
+
+  // 核心带（画在外层之上）
+  bgx.fillStyle = 'rgba(248,81,73,.55)';
+  bgx.strokeStyle = 'rgba(255,123,114,.95)';
+  for (const [x,y,w,h] of bands(cfg.CL, cfg.CR, cfg.CT, cfg.CB)){
+    if (w <= 0 || h <= 0) continue;
+    bgx.fillRect(x,y,w,h);
+    bgx.strokeRect(x+0.5,y+0.5,w-1,h-1);
+  }
+
+  bgDirty = false;
+}
+
+function scheduleDraw(){
+  if (!rafId) rafId = requestAnimationFrame(draw);
+}
+
+const KIND_COLOR = {
+  pass: [63,185,80],
+  grip: [255,159,123],
+  band: [255,159,123],
+  core: [248,81,73]
+};
+
+function draw(){
+  rafId = 0;
+  if (!cssW || !cssH) return;
+  if (bgDirty) renderBg();
+
+  const s = screenSize();
+  const k = cssW / s.w;
+
+  ctx.clearRect(0,0,cssW,cssH);
+  ctx.drawImage(bgc, 0, 0, cssW, cssH);
+
+  const now = performance.now();
+  const LIFE = 3000;
+  if (points.length) points = points.filter(p => now - p.t < LIFE);
+
+  for (const p of points){
+    const age = (now - p.t) / LIFE;
+    const alpha = 1 - age;
+    const [r,g,b] = KIND_COLOR[p.kind] || KIND_COLOR.pass;
+    const x = p.sx * k, y = p.sy * k;
+
+    ctx.beginPath();
+    ctx.arc(x, y, 5 + age * 10, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha*0.30})`;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(x, y, 3.5, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(${r},${g},${b},${alpha})`;
+    ctx.fill();
+  }
+
+  if (points.length) scheduleDraw();   // 没有点了就停下，别空转 60fps
+}
+
+/* ---------- polling ---------- */
+function applyStatus(s){
+  const oldSig = st.panel.x + 'x' + st.panel.y + '@' + st.rot;
+  st = Object.assign(st, s);
+  const newSig = st.panel.x + 'x' + st.panel.y + '@' + st.rot;
+  if (oldSig !== newSig) resize();
+
+  $('dot').className = 'dot ' + (s.running ? 'on' : 'off');
+  $('state').textContent = s.running ? '运行中' : '已停止';
+  $('devpill').textContent = 'device: ' + (s.device || '—');
+  $('rotpill').textContent = 'rot: ' + (s.rot ?? '—') + '°';
+  $('pidpill').textContent = 'pid: ' + (s.pid || '—');
+
+  if (s.config && !dragging && !localDirty){
+    const c = s.config;
+    const set = (id, v) => { if (v !== undefined && v !== null){ $('s'+id).value = v; $('v'+id).textContent = v; } };
+    set('L', c.left); set('R', c.right); set('T', c.top); set('B', c.bottom);
+    set('CL', c.coreLeft); set('CR', c.coreRight); set('CT', c.coreTop); set('CB', c.coreBottom);
+    set('M', c.major);
+    checkMajor();
+    bgDirty = true;
+    scheduleDraw();
+  }
+}
+
+/* MAJOR = 边缘带内的面积阈值：指尖 12~36，拇指贴边握持 40~76 */
+function checkMajor(){
+  const m = +$('sM').value;
+  const h = $('mhint');
+  if (!h) return;
+  if (m === 0){
+    h.style.color = 'var(--bad)';
+    h.textContent = '⚠ 0 = 外层带内全拦，边缘返回手势和上滑回桌面会完全失效。';
+  } else if (m > 76){
+    h.style.color = 'var(--warn)';
+    h.textContent = '⚠ ' + m + ' 高于拇指贴边握持的面积（40~76），握持边框时可能拦不住。';
+  } else {
+    h.style.color = '';
+    h.textContent = '边缘带内接触面积 ≥ 这个值就拦掉。实测：指尖 12~36，拇指贴着边框握持 40~76。';
+  }
+}
+let dragging = false;
+let localDirty = false;   // 用户动过滑块之后，就不再让轮询覆盖本地值
+function setDirty(v){
+  localDirty = v;
+  const d = $('dirty');
+  if (d) d.style.display = v ? 'block' : 'none';
+}
+
+function pollStatus(){
+  api({action:'status'}).then(s=>{
+    if (s.ok){
+      applyStatus(s);
+      if (!ready){                       // 首次：从当前末尾开始，不回放历史
+        ready = true;
+        since = s.log_lines || 0;
+        pollEvents();
+      }
+    } else if (s.error === 'unauthorized') askToken();
+  }).catch(()=>{});
+}
+
+function askToken(){
+  const t = prompt('需要访问令牌 (web.token):', token || '');
+  if (t !== null){ token = t.trim(); try{ localStorage.setItem('ef_token', token); }catch(e){} pollStatus(); }
+}
+
+let evBusy = false;
+function pollEvents(){
+  if (!ready || evBusy) return;
+  evBusy = true;
+  api({action:'events', since}).then(r=>{
+    evBusy = false;
+    if (!r.ok) return;
+    since = r.total;
+    if (!r.lines || !r.lines.length) return;
+    let added = 0;
+    for (const line of r.lines){
+      const m = line.match(RE);
+      if (!m) continue;
+      const [, slot, x, y, major, res, why] = m;
+      const sp = toScreen(+x, +y);
+      const kind = res === 'pass' ? 'pass' : (why === 'core' ? 'core' : 'grip');
+      points.push({sx: sp.sx, sy: sp.sy, kind, t: performance.now()});
+      addRow(slot, x, y, major, res, why);
+      added++;
+    }
+    if (points.length > 300) points.splice(0, points.length - 300);
+    if (added) scheduleDraw();
+  }).catch(()=>{ evBusy = false; });
+}
+
+function addRow(slot, x, y, major, res, why){
+  const tb = $('rows');
+  const tr = document.createElement('tr');
+  const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  const blocked = res === 'BLOCKED';
+  const cls = !blocked ? 'ok' : (why === 'core' ? 'core' : 'bad');
+  const txt = !blocked ? '放行' : (why === 'core' ? '拦截' : '拦截');
+  const whyTxt = !blocked ? '—' : (why === 'core' ? '核心带' : (why === 'grip' ? '握持' : '边缘带'));
+  tr.innerHTML = `<td>${t}</td><td>${slot}</td><td>${x}</td><td>${y}</td><td>${major}</td>` +
+                 `<td class="${cls}">${txt}</td><td>${whyTxt}</td>`;
+  tb.prepend(tr);
+  while (tb.children.length > 25) tb.lastChild.remove();
+}
+
+/* ---------- controls ---------- */
+['L','R','T','B','M','CL','CR','CT','CB'].forEach(k=>{
+  const s = $('s'+k), v = $('v'+k);
+  s.addEventListener('input', ()=>{
+    v.textContent = s.value;
+    setDirty(true);
+    bgDirty = true;
+    if (k === 'M') checkMajor();
+    scheduleDraw();
+  });
+  s.addEventListener('pointerdown', ()=> dragging = true);
+  s.addEventListener('pointerup',   ()=> dragging = false);
+  s.addEventListener('change',      ()=> dragging = false);
+});
+
+$('reset').onclick = ()=>{
+  setDirty(false);
+  pollStatus();
+  toast('已还原为当前配置');
+};
+
+$('apply').onclick = ()=>{
+  const c = cfgVals();
+  api({
+    action:'set',
+    left:c.L, right:c.R, top:c.T, bottom:c.B,
+    coreLeft:c.CL, coreRight:c.CR, coreTop:c.CT, coreBottom:c.CB,
+    major:c.M
+  }, 'POST').then(r=>{
+    if (r.ok){ setDirty(false); toast('已应用'); pollStatus(); }
+    else toast('失败: ' + (r.error||''));
+  }).catch(()=>toast('请求失败'));
+};
+
+$('stop').onclick  = ()=> api({action:'stop'},  'POST').then(r=>{ if(r.ok){applyStatus(r); toast('已停止');} });
+$('start').onclick = ()=> api({action:'start'}, 'POST').then(r=>{ if(r.ok){applyStatus(r); toast('已启动');} });
+
+/* ---------- boot ---------- */
+$('modepill').textContent = KSU ? 'KSU 直连' : 'HTTP';
+resize();
+scheduleDraw();
+window.addEventListener('resize', ()=>{ resize(); scheduleDraw(); });
+pollStatus();
+setInterval(pollStatus, 2000);
+setInterval(pollEvents, 700);
+</script>
+</body>
+</html>

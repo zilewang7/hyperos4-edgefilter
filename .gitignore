@@ -1,0 +1,12 @@
+# 构建产物
+build/
+dist/
+
+# 日志 / 临时文件
+*.log
+*.tmp
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

@@ -1,0 +1,18 @@
+#!/system/bin/sh
+# HTTP 包装层：鉴权 + 头，业务逻辑在 api.sh
+echo "Content-Type: application/json"
+echo "Cache-Control: no-store"
+echo
+
+TOKF=/data/adb/edgefilter/web.token
+if [ -f "$TOKF" ]; then
+    want=$(cat "$TOKF" 2>/dev/null)
+    got=$(echo "$QUERY_STRING" | sed -n 's/.*token=\([^&]*\).*/\1/p')
+    [ -n "$HTTP_X_TOKEN" ] && got="$HTTP_X_TOKEN"
+    if [ -n "$want" ] && [ "$got" != "$want" ]; then
+        printf '{"ok":false,"error":"unauthorized"}'
+        exit 0
+    fi
+fi
+
+exec /data/adb/modules/edgefilter/api.sh "$QUERY_STRING"

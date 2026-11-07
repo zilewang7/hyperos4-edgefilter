@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;26.1.10909125'
+
+      - name: Build module zip
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.1.10909125
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Create release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            > 装完如果边缘手势（侧滑返回 / 上滑回桌面）不灵，先把 `MAJOR` 调回 40~80 之间，并确认核心带宽度不超过外层边缘带。详见 README 的「排查」一节。
+
+            > If edge gestures stop working after installing, set `MAJOR` back to 40–80 and make sure the core band is not wider than the outer band. See the Troubleshooting section in the README.
