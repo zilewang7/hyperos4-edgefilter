@@ -74,8 +74,8 @@
     <h2>参数</h2>
 
     <div class="grp">
-      <h3><span class="sw core"></span>核心带 —— 落点在这里一律拦截</h3>
-      <div class="hint" style="margin-top:0;margin-bottom:8px">不看接触面积，贴边的那一小条直接用。</div>
+      <h3><span class="sw core"></span>核心带 —— 贴边误触取消</h3>
+      <div class="hint" style="margin-top:0;margin-bottom:8px">原地点击会被取消（应用收到 CANCEL），滑动照常放行，不影响侧滑返回。</div>
       <div class="row"><label>核心 左</label><span class="val"><span id="vCL">40</span> px</span></div>
       <input type="range" id="sCL" min="0" max="400" step="5" value="40">
       <div class="row"><label>核心 右</label><span class="val"><span id="vCR">40</span> px</span></div>
