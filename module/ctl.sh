@@ -51,6 +51,9 @@ do_start() {
         --left "${BAND_LEFT:-150}" --right "${BAND_RIGHT:-150}" \
         --top "${BAND_TOP:-0}" --bottom "${BAND_BOTTOM:-0}" \
         --major "${MAJOR:-40}" \
+        --core-left "${CORE_LEFT:-40}" --core-right "${CORE_RIGHT:-40}" \
+        --core-top "${CORE_TOP:-0}" --core-bottom "${CORE_BOTTOM:-0}" \
+        --core-slop "${CORE_SLOP:-12}" --core-hold-ms "${CORE_HOLD_MS:-200}" \
         --scale "${SCALE:-10}" --rot "${ROT:-auto}" \
         >> "$LOG" 2>&1 &
     pid=$!

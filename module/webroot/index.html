@@ -17,14 +17,15 @@
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;min-width:0}
   .canvas-wrap{flex:1;display:flex;align-items:center;min-height:0}
   .card h2{font-size:13px;margin:0 0 10px;color:var(--dim);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+  .grp{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line)}.grp:first-of-type{margin-top:0;padding-top:0;border-top:none}
   .grp h3{font-size:12px;margin:0 0 8px;font-weight:600;color:var(--fg);display:flex;align-items:center;gap:6px}
-  .sw{width:10px;height:10px;border-radius:2px;flex:none}.sw.band{background:rgba(248,81,73,.22);border:1px solid rgba(248,81,73,.55)}
+  .sw{width:10px;height:10px;border-radius:2px;flex:none}.sw.core{background:rgba(248,81,73,.75)}.sw.band{background:rgba(248,81,73,.22);border:1px solid rgba(248,81,73,.55)}
   canvas{width:100%;display:block;border-radius:8px;background:#010409}
-  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:10px 0 4px}.row label{color:var(--dim);font-size:13px}.row .val{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600;min-width:52px;text-align:right}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:9px 0 3px}.row label{color:var(--dim);font-size:13px}.row .val{font-variant-numeric:tabular-nums;color:var(--accent);font-weight:600;min-width:56px;text-align:right}
   input[type=range]{width:100%;accent-color:var(--accent);margin:0}
   .btns{display:flex;gap:8px;margin-top:16px;flex-wrap:wrap}
   button{flex:1;min-width:88px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:#21262d;color:var(--fg);cursor:pointer;font-size:13px}button:hover{border-color:#30363d;background:#262c36}button:disabled{opacity:.45;cursor:wait}button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}button.primary:hover{background:#2f81f7}
-  table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}td.ok{color:var(--ok)}td.bad{color:var(--bad)}
+  table{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:5px 6px;border-bottom:1px solid var(--line)}th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.5px}td.ok{color:var(--ok)}td.bad{color:var(--bad)}td.core{color:#ff7b72;font-weight:600}
   .meta{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:10px}.meta b{color:var(--fg);font-weight:600}.hint{color:var(--dim);font-size:12px;margin-top:6px}
   #toast{position:fixed;right:18px;bottom:18px;background:#21262d;border:1px solid var(--line);padding:10px 14px;border-radius:8px;opacity:0;transition:opacity .2s;pointer-events:none;font-size:13px}#toast.show{opacity:1}
 </style>
@@ -40,19 +41,30 @@
   <section class="card">
     <h2>实时判定</h2>
     <div class="canvas-wrap"><canvas id="cv"></canvas></div>
-    <div class="meta"><span>绿点 <b>放行</b></span><span style="color:#ff9f7b">橙点 <b>边缘握持拦截</b></span></div>
-    <div class="hint">只判定首帧，3 秒后淡出。正常触点不延迟、不补点、不取消；首帧信息不足时直接放行。</div>
+    <div class="meta"><span>绿点 <b>放行</b></span><span style="color:#ff9f7b">橙点 <b>握持拦截</b></span><span style="color:#ff7b72">红点 <b>核心带点击拦截</b></span></div>
+    <div class="hint">每个触点只判定一次，3 秒后淡出。核心带内滑动会补发起手点后放行，点击则整段丢弃。</div>
   </section>
   <section class="card">
     <h2>参数</h2>
     <div class="grp">
-      <h3><span class="sw band"></span>边缘带 —— 拦贴边握持</h3>
-      <div class="row"><label>左边缘带</label><span class="val"><span id="vL">150</span> px</span></div><input type="range" id="sL" min="0" max="400" step="10" value="150">
-      <div class="row"><label>右边缘带</label><span class="val"><span id="vR">150</span> px</span></div><input type="range" id="sR" min="0" max="400" step="10" value="150">
-      <div class="row"><label>上边缘带</label><span class="val"><span id="vT">0</span> px</span></div><input type="range" id="sT" min="0" max="400" step="10" value="0">
-      <div class="row"><label>下边缘带</label><span class="val"><span id="vB">0</span> px</span></div><input type="range" id="sB" min="0" max="400" step="10" value="0">
+      <h3><span class="sw band"></span>外层边缘带 —— 拦贴边握持</h3>
+      <div class="row"><label>左</label><span class="val"><span id="vL">150</span> px</span></div><input type="range" id="sL" min="0" max="400" step="10" value="150">
+      <div class="row"><label>右</label><span class="val"><span id="vR">150</span> px</span></div><input type="range" id="sR" min="0" max="400" step="10" value="150">
+      <div class="row"><label>上</label><span class="val"><span id="vT">0</span> px</span></div><input type="range" id="sT" min="0" max="400" step="10" value="0">
+      <div class="row"><label>下</label><span class="val"><span id="vB">0</span> px</span></div><input type="range" id="sB" min="0" max="400" step="10" value="0">
       <div class="row"><label>握持阈值 MAJOR</label><span class="val"><span id="vM">40</span></span></div><input type="range" id="sM" min="0" max="300" step="5" value="40">
       <div class="hint" id="mhint"></div>
+    </div>
+    <div class="grp">
+      <h3><span class="sw core"></span>核心带 —— 贴边点击取消，滑动放行</h3>
+      <div class="hint" style="margin-top:0;margin-bottom:8px">落点在这里的触点先扣住：动了就补发起手点放行，没动就整段丢弃。丢弃不需要任何取消事件。</div>
+      <div class="row"><label>左</label><span class="val"><span id="vCL">40</span> px</span></div><input type="range" id="sCL" min="0" max="400" step="5" value="40">
+      <div class="row"><label>右</label><span class="val"><span id="vCR">40</span> px</span></div><input type="range" id="sCR" min="0" max="400" step="5" value="40">
+      <div class="row"><label>上</label><span class="val"><span id="vCT">0</span> px</span></div><input type="range" id="sCT" min="0" max="400" step="5" value="0">
+      <div class="row"><label>下</label><span class="val"><span id="vCB">0</span> px</span></div><input type="range" id="sCB" min="0" max="400" step="5" value="0">
+      <div class="row"><label>判定滑动所需位移</label><span class="val"><span id="vCS">12</span> px</span></div><input type="range" id="sCS" min="2" max="60" step="2" value="12">
+      <div class="row"><label>扣住上限</label><span class="val"><span id="vCH">200</span> ms</span></div><input type="range" id="sCH" min="0" max="600" step="20" value="200">
+      <div class="hint" id="chint"></div>
     </div>
     <div class="btns"><button class="primary" id="apply">应用并重启</button><button id="reset">还原</button><button id="stop">停止</button><button id="start">启动</button></div>
     <div class="hint" id="dirty" style="display:none;color:var(--warn)">有未应用的改动</div>
@@ -65,7 +77,7 @@
 <div id="toast"></div>
 <script>
 const $ = id => document.getElementById(id);
-const RE = /slot (\d+) new contact at \((-?\d+),(-?\d+)\) major=(-?\d+) -> (BLOCKED|pass)(?: (\w+))?/;
+const RE = /slot (\d+) (new contact|core swipe|core hold|core tap) at \((-?\d+),(-?\d+)\) major=(-?\d+) -> (BLOCKED|pass)(?: (\w+))?/;
 let st = {running:false,panel:{x:21359,y:31999},rot:90,log_lines:0,config:{}};
 let points = [], since = 0, ready = false, token = '';
 try { token = localStorage.getItem('ef_token') || ''; } catch(e) {}
@@ -80,27 +92,44 @@ function toScreen(x,y){const r=st.rot%360,P=st.panel;switch(r){case 0:return{sx:
 const cv=$('cv'),ctx=cv.getContext('2d'),bgc=document.createElement('canvas'),bgx=bgc.getContext('2d');
 let cssW=0,cssH=0,bgDirty=true,rafId=0;
 function resize(){const w=cv.clientWidth||600,s=screenSize(),h=Math.round(w*s.h/s.w),dpr=window.devicePixelRatio||1;cv.style.height=h+'px';cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);ctx.setTransform(dpr,0,0,dpr,0,0);cssW=w;cssH=h;bgDirty=true;}
-function cfgVals(){return{L:+$('sL').value,R:+$('sR').value,T:+$('sT').value,B:+$('sB').value,M:+$('sM').value};}
+function cfgVals(){
+  const L=+$('sL').value,R=+$('sR').value,T=+$('sT').value,B=+$('sB').value;
+  const clamp=(c,b)=>b>0?Math.min(c,b):0;
+  return {L,R,T,B,M:+$('sM').value,
+    CL:clamp(+$('sCL').value,L),CR:clamp(+$('sCR').value,R),CT:clamp(+$('sCT').value,T),CB:clamp(+$('sCB').value,B),
+    CS:+$('sCS').value,CH:+$('sCH').value};
+}
 function renderBg(){
   const s=screenSize(),k=cssW/s.w,unit=(st.config&&st.config.scale)||10,cfg=cfgVals(),dpr=window.devicePixelRatio||1;
   bgc.width=Math.round(cssW*dpr);bgc.height=Math.round(cssH*dpr);bgx.setTransform(dpr,0,0,dpr,0,0);bgx.clearRect(0,0,cssW,cssH);bgx.fillStyle='#0b1220';bgx.fillRect(0,0,cssW,cssH);bgx.strokeStyle='#30363d';bgx.lineWidth=1;bgx.strokeRect(.5,.5,cssW-1,cssH-1);
-  const bands=[[0,0,cfg.L*unit*k,cssH],[cssW-cfg.R*unit*k,0,cfg.R*unit*k,cssH],[0,0,cssW,cfg.T*unit*k],[0,cssH-cfg.B*unit*k,cssW,cfg.B*unit*k]];
-  bgx.fillStyle='rgba(248,81,73,.18)';bgx.strokeStyle='rgba(248,81,73,.55)';
-  for(const[x,y,w,h]of bands){if(w<=0||h<=0)continue;bgx.fillRect(x,y,w,h);bgx.strokeRect(x+.5,y+.5,w-1,h-1);}bgDirty=false;
+  const bands=(l,r,t,b)=>[[0,0,l*unit*k,cssH],[cssW-r*unit*k,0,r*unit*k,cssH],[0,0,cssW,t*unit*k],[0,cssH-b*unit*k,cssW,b*unit*k]];
+  bgx.fillStyle='rgba(248,81,73,.14)';bgx.strokeStyle='rgba(248,81,73,.45)';
+  for(const[x,y,w,h]of bands(cfg.L,cfg.R,cfg.T,cfg.B)){if(w<=0||h<=0)continue;bgx.fillRect(x,y,w,h);bgx.strokeRect(x+.5,y+.5,w-1,h-1);}
+  bgx.fillStyle='rgba(248,81,73,.55)';bgx.strokeStyle='rgba(255,123,114,.95)';
+  for(const[x,y,w,h]of bands(cfg.CL,cfg.CR,cfg.CT,cfg.CB)){if(w<=0||h<=0)continue;bgx.fillRect(x,y,w,h);bgx.strokeRect(x+.5,y+.5,w-1,h-1);}
+  bgDirty=false;
 }
 function scheduleDraw(){if(!rafId)rafId=requestAnimationFrame(draw);}
+const KIND_COLOR={pass:[63,185,80],grip:[255,159,123],core:[248,81,73]};
 function draw(){
   rafId=0;if(!cssW||!cssH)return;if(bgDirty)renderBg();const k=cssW/screenSize().w;ctx.clearRect(0,0,cssW,cssH);ctx.drawImage(bgc,0,0,cssW,cssH);
   const now=performance.now(),LIFE=3000;if(points.length)points=points.filter(p=>now-p.t<LIFE);
-  for(const p of points){const age=(now-p.t)/LIFE,a=1-age,rgb=p.kind==='grip'?'255,159,123':'63,185,80',x=p.sx*k,y=p.sy*k;ctx.beginPath();ctx.arc(x,y,5+age*10,0,Math.PI*2);ctx.fillStyle=`rgba(${rgb},${a*.30})`;ctx.fill();ctx.beginPath();ctx.arc(x,y,3.5,0,Math.PI*2);ctx.fillStyle=`rgba(${rgb},${a})`;ctx.fill();}
+  for(const p of points){const age=(now-p.t)/LIFE,a=1-age,[r,g,b]=KIND_COLOR[p.kind]||KIND_COLOR.pass,x=p.sx*k,y=p.sy*k;
+    ctx.beginPath();ctx.arc(x,y,5+age*10,0,Math.PI*2);ctx.fillStyle=`rgba(${r},${g},${b},${a*.30})`;ctx.fill();
+    ctx.beginPath();ctx.arc(x,y,3.5,0,Math.PI*2);ctx.fillStyle=`rgba(${r},${g},${b},${a})`;ctx.fill();}
   if(points.length)scheduleDraw();
 }
 function applyStatus(s){
   const oldSig=st.panel.x+'x'+st.panel.y+'@'+st.rot;st=Object.assign(st,s);const newSig=st.panel.x+'x'+st.panel.y+'@'+st.rot;if(oldSig!==newSig)resize();
   $('dot').className='dot '+(s.running?'on':'off');$('state').textContent=s.running?'运行中':'已停止';$('devpill').textContent='device: '+(s.device||'—');$('rotpill').textContent='rot: '+(s.rot??'—')+'°';$('pidpill').textContent='pid: '+(s.pid||'—');
-  if(s.config&&!dragging&&!localDirty){const c=s.config,set=(id,v)=>{if(v!==undefined&&v!==null){$('s'+id).value=v;$('v'+id).textContent=v;}};set('L',c.left);set('R',c.right);set('T',c.top);set('B',c.bottom);set('M',c.major);checkMajor();bgDirty=true;scheduleDraw();}
+  if(s.config&&!dragging&&!localDirty){const c=s.config,set=(id,v)=>{if(v!==undefined&&v!==null){$('s'+id).value=v;$('v'+id).textContent=v;}};
+    set('L',c.left);set('R',c.right);set('T',c.top);set('B',c.bottom);set('M',c.major);
+    set('CL',c.coreLeft);set('CR',c.coreRight);set('CT',c.coreTop);set('CB',c.coreBottom);
+    set('CS',c.coreSlop);set('CH',c.coreHold);
+    checkMajor();checkCore();bgDirty=true;scheduleDraw();}
 }
-function checkMajor(){const m=+$('sM').value,h=$('mhint');if(m===0){h.style.color='var(--bad)';h.textContent='⚠ 0 = 边缘带内全拦，边缘返回手势和上滑回桌面会失效。';}else if(m>76){h.style.color='var(--warn)';h.textContent='⚠ '+m+' 高于拇指贴边握持面积（40~76），可能拦不住。';}else{h.style.color='';h.textContent='首帧位于边缘带且面积 ≥ '+m+' 才整段拦截。实测：指尖 12~36，拇指握持 40~76。';}}
+function checkMajor(){const m=+$('sM').value,h=$('mhint');if(m===0){h.style.color='var(--bad)';h.textContent='⚠ 0 = 边缘带内全拦，边缘返回手势和上滑回桌面会失效。';}else if(m>76){h.style.color='var(--warn)';h.textContent='⚠ '+m+' 高于拇指贴边握持面积（40~76），可能拦不住。';}else{h.style.color='';h.textContent='起手帧位于边缘带且面积 ≥ '+m+' 才整段拦截。实测：指尖 12~36，拇指握持 40~76。';}}
+function checkCore(){const h=$('chint'),hold=+$('sCH').value;if(hold===0){h.style.color='var(--warn)';h.textContent='0 = 关闭核心带，贴边点击不再拦截（退回纯边缘带过滤）。';}else{h.style.color='';h.textContent='扣住 '+hold+' ms 仍未移动就放行，保证长按可用。滑动起手会晚 1~2 帧（约 8~16ms）。';}}
 let dragging=false,localDirty=false;
 function setDirty(v){localDirty=v;$('dirty').style.display=v?'block':'none';}
 function pollStatus(){api({action:'status'}).then(s=>{if(s.ok){applyStatus(s);if(!ready){ready=true;since=s.log_lines||0;pollEvents();}}else if(s.error==='unauthorized')askToken();}).catch(()=>{});}
@@ -108,20 +137,35 @@ function askToken(){const t=prompt('需要访问令牌 (web.token):',token||'');
 let evBusy=false;
 function pollEvents(){
   if(!ready||evBusy)return;evBusy=true;api({action:'events',since}).then(r=>{evBusy=false;if(!r.ok)return;if(r.total<since){points=[];$('rows').textContent='';}since=r.total;if(!r.lines||!r.lines.length)return;let added=0;
-    for(const line of r.lines){const m=line.match(RE);if(!m)continue;const[,slot,x,y,major,res,why]=m;if(+x>=0&&+y>=0){const sp=toScreen(+x,+y);points.push({sx:sp.sx,sy:sp.sy,kind:res==='BLOCKED'?'grip':'pass',t:performance.now()});}addRow(slot,x,y,major,res,why);added++;}
+    for(const line of r.lines){const m=line.match(RE);if(!m)continue;const[,slot,kind,x,y,major,res,why]=m;if(+x>=0&&+y>=0){const sp=toScreen(+x,+y);
+        const k=res==='pass'?'pass':(why==='core'?'core':'grip');
+        points.push({sx:sp.sx,sy:sp.sy,kind:k,t:performance.now()});}
+      addRow(slot,x,y,major,res,why,kind);added++;}
     if(points.length>300)points.splice(0,points.length-300);if(added)scheduleDraw();
   }).catch(()=>{evBusy=false;});
 }
-function addRow(slot,x,y,major,res,why){const tb=$('rows'),tr=document.createElement('tr'),t=new Date().toLocaleTimeString('zh-CN',{hour12:false}),blocked=res==='BLOCKED';const whyTxt=blocked?'边缘握持':why==='incomplete'?'信息不足，放行':'—';tr.innerHTML=`<td>${t}</td><td>${slot}</td><td>${x}</td><td>${y}</td><td>${+major<0?'—':major}</td><td class="${blocked?'bad':'ok'}">${blocked?'拦截':'放行'}</td><td>${whyTxt}</td>`;tb.prepend(tr);while(tb.children.length>25)tb.lastChild.remove();}
-['L','R','T','B','M'].forEach(k=>{const s=$('s'+k),v=$('v'+k);s.addEventListener('input',()=>{v.textContent=s.value;setDirty(true);bgDirty=true;if(k==='M')checkMajor();scheduleDraw();});s.addEventListener('pointerdown',()=>dragging=true);s.addEventListener('pointerup',()=>dragging=false);s.addEventListener('change',()=>dragging=false);});
+function addRow(slot,x,y,major,res,why,kind){
+  const tb=$('rows'),tr=document.createElement('tr'),t=new Date().toLocaleTimeString('zh-CN',{hour12:false}),blocked=res==='BLOCKED';
+  let whyTxt='—';
+  if(blocked) whyTxt = why==='core' ? '核心带点击' : '边缘握持';
+  else if(why==='incomplete') whyTxt='信息不足，放行';
+  else if(kind==='core swipe') whyTxt='核心带滑动，放行';
+  else if(kind==='core hold') whyTxt='扣住超时，放行';
+  const cls = blocked ? (why==='core'?'core':'bad') : 'ok';
+  tr.innerHTML=`<td>${t}</td><td>${slot}</td><td>${x}</td><td>${y}</td><td>${+major<0?'—':major}</td><td class="${cls}">${blocked?'拦截':'放行'}</td><td>${whyTxt}</td>`;
+  tb.prepend(tr);while(tb.children.length>25)tb.lastChild.remove();
+}
+['L','R','T','B','M','CL','CR','CT','CB','CS','CH'].forEach(k=>{const s=$('s'+k),v=$('v'+k);s.addEventListener('input',()=>{v.textContent=s.value;setDirty(true);bgDirty=true;if(k==='M')checkMajor();if(k==='CH')checkCore();scheduleDraw();});s.addEventListener('pointerdown',()=>dragging=true);s.addEventListener('pointerup',()=>dragging=false);s.addEventListener('change',()=>dragging=false);});
 let controlBusy=false;
 function controls(disabled){controlBusy=disabled;document.querySelectorAll('.btns button').forEach(b=>b.disabled=disabled);}
 function request(params,success){if(controlBusy)return;controls(true);api(params,'POST').then(r=>{if(r.ok){if(r.running!==undefined)applyStatus(r);success();pollStatus();}else toast('失败: '+(r.error||''));}).catch(()=>toast('请求失败')).then(()=>controls(false));}
 $('reset').onclick=()=>{if(controlBusy)return;setDirty(false);pollStatus();toast('已还原为当前配置');};
-$('apply').onclick=()=>{const c=cfgVals();request({action:'set',left:c.L,right:c.R,top:c.T,bottom:c.B,major:c.M},()=>{setDirty(false);toast('已应用');});};
+$('apply').onclick=()=>{const c=cfgVals();request({action:'set',left:c.L,right:c.R,top:c.T,bottom:c.B,major:c.M,
+  coreLeft:c.CL,coreRight:c.CR,coreTop:c.CT,coreBottom:c.CB,coreSlop:c.CS,coreHold:c.CH},()=>{setDirty(false);toast('已应用');});};
 $('stop').onclick=()=>request({action:'stop'},()=>toast('已停止，触控已回原生'));
 $('start').onclick=()=>request({action:'start'},()=>toast('已启动'));
-$('modepill').textContent=KSU?'KSU 直连':'HTTP';resize();scheduleDraw();window.addEventListener('resize',()=>{resize();scheduleDraw();});pollStatus();setInterval(pollStatus,2000);setInterval(pollEvents,700);
+$('modepill').textContent=KSU?'KSU 直连':'HTTP';resize();scheduleDraw();window.addEventListener('resize',()=>{resize();scheduleDraw();});
+checkMajor();checkCore();pollStatus();setInterval(pollStatus,2000);setInterval(pollEvents,700);
 </script>
 </body>
 </html>

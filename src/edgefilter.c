@@ -1,10 +1,20 @@
 /*
  * EdgeFilter: a deliberately small evdev -> uinput contact filter.
  *
- * A new contact is judged once, at its first SYN_REPORT. Complete edge grips
- * are dropped for their whole lifetime; every other contact is passed through
- * unchanged. There is no delayed DOWN, synthetic CANCEL, or screen lifecycle.
- * Any stream/write error is fatal: closing the descriptors restores native touch.
+ * A new contact is judged once, at its first SYN_REPORT:
+ *
+ *   grip      area >= MAJOR inside the outer band  -> dropped for its lifetime
+ *   core      inside the inner band                -> held, then decided
+ *   pass      everything else                      -> forwarded unchanged
+ *
+ * "Held" is the only state that delays anything, and it is the safe direction:
+ * the DOWN is not forwarded yet, so dropping a held contact emits no events at
+ * all and therefore needs no SYN_DROPPED or synthetic cancel. A held contact is
+ * released (DOWN replayed at its true first position) as soon as it moves more
+ * than CORE_SLOP, or after CORE_HOLD_MS. If it lifts first it is dropped.
+ *
+ * Every other contact is byte-for-byte passthrough. Any stream or write error
+ * is fatal: closing the descriptors restores native touch.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,6 +27,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <poll.h>
+#include <time.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/file.h>
@@ -28,13 +39,17 @@
 
 #define MAX_SLOTS 16
 #define MAX_FRAME 1024
-#define OUT_CAP (MAX_FRAME + 3)
+#define MAX_MT_AXES 8
+#define OUT_CAP (MAX_FRAME + 3 * MAX_SLOTS + 4)
 #define NLONGS(n) (((n) + (int)(8 * sizeof(long)) - 1) / (int)(8 * sizeof(long)))
 #define BIT_TEST(bits, n) (((bits)[(n) / (8 * sizeof(long))] >> ((n) % (8 * sizeof(long)))) & 1UL)
 
 #define SEEN_X 1
 #define SEEN_Y 2
 #define SEEN_MAJOR 4
+
+enum { ST_EMPTY = 0, ST_HELD, ST_PASS, ST_DROP };
+enum { ACT_FORWARD = 0, ACT_DROP, ACT_PENDING };
 
 static volatile sig_atomic_t g_stop;
 static int src_fd = -1, ui_fd = -1, lock_fd = -1;
@@ -44,29 +59,40 @@ static char device_name[64];
 static struct input_id device_id;
 static int max_x, max_y;
 static int band_l, band_r, band_t, band_b;
+static int core_l, core_r, core_t, core_b;
+static int core_slop = 12;
+static int core_hold_ms = 200;
 static int major_min = 40;
 static double scale = 10.0;
 static int rot = 1;
 static int has_btn_touch, has_tool_finger;
 
+struct mt_axis { int code; int value; };
+
 struct slot {
-    int active;
-    int decided;
-    int blocked;
-    int x, y, major;
+    int state;
+    int tid;
+    int x, y;                 /* latest position, -1 = unknown */
+    int sx, sy, smajor;       /* first-frame values */
     unsigned seen;
+    int pending_new;          /* DOWN seen, not judged yet */
+    int synth;                /* release now: replay a DOWN first */
+    long long held_ms;
+    struct mt_axis axes[MAX_MT_AXES];
+    int n_axes;
 };
 
 struct fev {
     struct input_event ev;
-    int slot;                  /* -1: not slot-specific */
-    int button;                /* BTN_TOUCH / BTN_TOOL_FINGER */
+    int slot;                 /* -1: global, -2: legacy axis */
+    int action;
+    int button;
 };
 
 static struct slot slots[MAX_SLOTS];
 static int new_slots[MAX_SLOTS], new_count;
 static struct fev frame[MAX_FRAME];
-static int frame_count, cur_slot;
+static int frame_count, cur_slot, frame_start_slot;
 static int emitted_down;
 
 static void logmsg(const char *fmt, ...)
@@ -86,28 +112,62 @@ static void on_stop(int sig)
     g_stop = 1;
 }
 
-static int in_band(int x, int y)
+static long long now_ms(void)
 {
-    double l = band_l * scale, r = band_r * scale;
-    double t = band_t * scale, b = band_b * scale;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static int iabs(int v) { return v < 0 ? -v : v; }
+
+static int in_edges(int x, int y, int l, int r, int t, int b)
+{
+    double L = l * scale, R = r * scale, T = t * scale, B = b * scale;
 
     switch (rot) {
     case 0:
-        return (l > 0 && x < l) || (r > 0 && x > max_x - r) ||
-               (t > 0 && y < t) || (b > 0 && y > max_y - b);
+        return (L > 0 && x < L) || (R > 0 && x > max_x - R) ||
+               (T > 0 && y < T) || (B > 0 && y > max_y - B);
     case 1:
-        return (l > 0 && y < l) || (r > 0 && y > max_y - r) ||
-               (t > 0 && x > max_x - t) || (b > 0 && x < b);
+        return (L > 0 && y < L) || (R > 0 && y > max_y - R) ||
+               (T > 0 && x > max_x - T) || (B > 0 && x < B);
     case 2:
-        return (l > 0 && x > max_x - l) || (r > 0 && x < r) ||
-               (t > 0 && y > max_y - t) || (b > 0 && y < b);
+        return (L > 0 && x > max_x - L) || (R > 0 && x < R) ||
+               (T > 0 && y > max_y - T) || (B > 0 && y < B);
     default:
-        return (l > 0 && y > max_y - l) || (r > 0 && y < r) ||
-               (t > 0 && x < t) || (b > 0 && x > max_x - b);
+        return (L > 0 && y > max_y - L) || (R > 0 && y < R) ||
+               (T > 0 && x < T) || (B > 0 && x > max_x - B);
     }
 }
 
-static int add_event(const struct input_event *ev, int slot, int button)
+static int in_band(int x, int y) { return in_edges(x, y, band_l, band_r, band_t, band_b); }
+static int in_core(int x, int y) { return in_edges(x, y, core_l, core_r, core_t, core_b); }
+
+static int core_active(void)
+{
+    return core_hold_ms > 0 && (core_l > 0 || core_r > 0 || core_t > 0 || core_b > 0);
+}
+
+static int any_pass_down(void)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (slots[i].state == ST_PASS) return 1;
+    return 0;
+}
+
+static void record_axis(struct slot *s, int code, int value)
+{
+    for (int i = 0; i < s->n_axes; i++)
+        if (s->axes[i].code == code) { s->axes[i].value = value; return; }
+    if (s->n_axes < MAX_MT_AXES) {
+        s->axes[s->n_axes].code = code;
+        s->axes[s->n_axes].value = value;
+        s->n_axes++;
+    }
+}
+
+static int add_event(const struct input_event *ev, int slot, int action, int button)
 {
     if (frame_count >= MAX_FRAME) {
         logmsg("input frame overflow; disabling filter");
@@ -115,12 +175,22 @@ static int add_event(const struct input_event *ev, int slot, int button)
     }
     frame[frame_count].ev = *ev;
     frame[frame_count].slot = slot;
+    frame[frame_count].action = action;
     frame[frame_count].button = button;
     frame_count++;
     return 0;
 }
 
-/* Returns 0 on success. A malformed/dropped source frame is deliberately fatal. */
+static int action_for(int slot)
+{
+    switch (slots[slot].state) {
+    case ST_PASS: return ACT_FORWARD;
+    case ST_DROP:
+    case ST_HELD: return ACT_DROP;
+    default:      return ACT_PENDING;
+    }
+}
+
 static int handle_event(const struct input_event *ev)
 {
     if (ev->type == EV_SYN) {
@@ -128,21 +198,19 @@ static int handle_event(const struct input_event *ev)
             logmsg("source SYN_DROPPED; disabling filter instead of guessing state");
             return -1;
         }
-        return add_event(ev, -1, 0);
+        return add_event(ev, -1, ACT_FORWARD, 0);
     }
 
     if (ev->type == EV_KEY) {
         int button = (ev->code == BTN_TOUCH || ev->code == BTN_TOOL_FINGER);
-        return add_event(ev, -1, button);
+        return add_event(ev, -1, button ? ACT_PENDING : ACT_FORWARD, button);
     }
 
     if (ev->type != EV_ABS)
-        return add_event(ev, -1, 0);
+        return add_event(ev, -1, ACT_FORWARD, 0);
 
-    if (ev->code == ABS_X || ev->code == ABS_Y) {
-        /* Global legacy axes may describe a rejected MT contact. */
-        return add_event(ev, -2, 0);
-    }
+    if (ev->code == ABS_X || ev->code == ABS_Y)
+        return add_event(ev, -2, ACT_PENDING, 0);   /* may describe a dropped contact */
 
     if (ev->code == ABS_MT_SLOT) {
         if (ev->value < 0 || ev->value >= MAX_SLOTS) {
@@ -150,8 +218,7 @@ static int handle_event(const struct input_event *ev)
             return -1;
         }
         cur_slot = ev->value;
-        /* Keep slot selections: omitting them would change subsequent event routing. */
-        return add_event(ev, -1, 0);
+        return add_event(ev, -1, ACT_FORWARD, 0);
     }
 
     switch (ev->code) {
@@ -163,118 +230,208 @@ static int handle_event(const struct input_event *ev)
     case ABS_MT_WIDTH_MINOR:
         break;
     default:
-        return add_event(ev, cur_slot, 0);
+        return add_event(ev, cur_slot, action_for(cur_slot), 0);
     }
 
     struct slot *s = &slots[cur_slot];
-    switch (ev->code) {
-    case ABS_MT_TRACKING_ID:
-        if (ev->value >= 0) {
-            if (s->active || !s->decided) {
-                logmsg("invalid DOWN on slot %d; disabling filter", cur_slot);
-                return -1;
-            }
-            if (new_count >= MAX_SLOTS) return -1;
-            s->active = 1;
-            s->decided = 0;   /* also marks an unjudged DOWN in this frame */
-            s->blocked = 0;
-            s->x = s->y = s->major = -1;
-            s->seen = 0;
-            new_slots[new_count++] = cur_slot;
-        } else {
-            s->active = 0;
+
+    if (ev->code == ABS_MT_TRACKING_ID && ev->value >= 0) {
+        if (s->state != ST_EMPTY || s->pending_new) {
+            logmsg("invalid DOWN on slot %d; disabling filter", cur_slot);
+            return -1;
         }
-        break;
-    case ABS_MT_POSITION_X:
-        if (!s->decided) { s->x = ev->value; s->seen |= SEEN_X; }
-        break;
-    case ABS_MT_POSITION_Y:
-        if (!s->decided) { s->y = ev->value; s->seen |= SEEN_Y; }
-        break;
-    case ABS_MT_TOUCH_MAJOR:
-        if (!s->decided) { s->major = ev->value; s->seen |= SEEN_MAJOR; }
-        break;
+        if (new_count >= MAX_SLOTS) return -1;
+        s->state = ST_EMPTY;          /* undecided until the frame ends */
+        s->pending_new = 1;
+        s->tid = ev->value;
+        s->x = s->y = s->smajor = -1;
+        s->sx = s->sy = -1;
+        s->seen = 0;
+        s->synth = 0;
+        s->n_axes = 0;
+        s->held_ms = 0;
+        new_slots[new_count++] = cur_slot;
+        return add_event(ev, cur_slot, ACT_PENDING, 0);
     }
-    return add_event(ev, cur_slot, 0);
+
+    if (ev->code == ABS_MT_TRACKING_ID) {
+        int action = action_for(cur_slot);
+        /* A held contact was never forwarded, so dropping it needs no cancel. */
+        if (s->state == ST_HELD)
+            logmsg("slot %d core tap at (%d,%d) major=%d -> BLOCKED core",
+                   cur_slot, s->sx, s->sy, s->smajor);
+        s->state = ST_EMPTY;
+        s->pending_new = 0;
+        s->synth = 0;
+        return add_event(ev, cur_slot, action, 0);
+    }
+
+    if (ev->code == ABS_MT_POSITION_X) {
+        s->x = ev->value;
+        if (s->pending_new) { s->sx = ev->value; s->seen |= SEEN_X; }
+    } else if (ev->code == ABS_MT_POSITION_Y) {
+        s->y = ev->value;
+        if (s->pending_new) { s->sy = ev->value; s->seen |= SEEN_Y; }
+    } else if (ev->code == ABS_MT_TOUCH_MAJOR) {
+        s->smajor = ev->value;
+        if (s->pending_new) {
+            s->seen |= SEEN_MAJOR;
+            record_axis(s, ev->code, ev->value);
+        }
+    } else if (s->pending_new) {
+        /* Only the first frame describes the contact as it appeared. */
+        record_axis(s, ev->code, ev->value);
+    }
+    return add_event(ev, cur_slot, action_for(cur_slot), 0);
 }
 
-static int any_allowed_down(void)
+static void decide_contacts(void)
 {
-    for (int i = 0; i < MAX_SLOTS; i++)
-        if (slots[i].active && !slots[i].blocked) return 1;
-    return 0;
-}
+    long long now = now_ms();
 
-static void decide_new_contacts(void)
-{
     for (int n = 0; n < new_count; n++) {
         struct slot *s = &slots[new_slots[n]];
         int complete = (s->seen & (SEEN_X | SEEN_Y)) == (SEEN_X | SEEN_Y);
-        int edge = complete && in_band(s->x, s->y);
         int area_known = (s->seen & SEEN_MAJOR) != 0;
+        s->pending_new = 0;
 
         /* Fail open: never judge with a stale axis or an assumed contact area. */
-        s->blocked = edge && (major_min == 0 || (area_known && s->major >= major_min));
-        s->decided = 1;
-
-        const char *result = s->blocked ? "BLOCKED" : "pass";
-        const char *reason = !complete || (edge && major_min > 0 && !area_known)
-                           ? "incomplete" : s->blocked ? "grip" : edge ? "area" : "outside";
-        logmsg("slot %d new contact at (%d,%d) major=%d -> %s %s",
-               new_slots[n], s->x, s->y, s->major, result, reason);
+        if (!complete) {
+            s->state = ST_PASS;
+            logmsg("slot %d new contact at (%d,%d) major=%d -> pass incomplete",
+                   new_slots[n], s->sx, s->sy, s->smajor);
+            continue;
+        }
+        if (in_band(s->sx, s->sy) &&
+            (major_min == 0 || (area_known && s->smajor >= major_min))) {
+            s->state = ST_DROP;
+            logmsg("slot %d new contact at (%d,%d) major=%d -> BLOCKED grip",
+                   new_slots[n], s->sx, s->sy, s->smajor);
+            continue;
+        }
+        if (core_active() && in_core(s->sx, s->sy)) {
+            s->state = ST_HELD;
+            s->held_ms = now;
+            continue;      /* decided when it moves or lifts */
+        }
+        s->state = ST_PASS;
+        logmsg("slot %d new contact at (%d,%d) major=%d -> pass %s",
+               new_slots[n], s->sx, s->sy, s->smajor,
+               in_band(s->sx, s->sy) ? "area" : "outside");
     }
     new_count = 0;
+
+    int slop = (int)(core_slop * scale);
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        struct slot *s = &slots[i];
+        if (s->state != ST_HELD) continue;
+
+        int moved = (s->x >= 0 && s->sx >= 0 && iabs(s->x - s->sx) > slop) ||
+                    (s->y >= 0 && s->sy >= 0 && iabs(s->y - s->sy) > slop);
+        int expired = (now - s->held_ms) >= core_hold_ms;
+
+        if (!moved && !expired) continue;
+        s->state = ST_PASS;
+        s->synth = 1;
+        logmsg("slot %d core %s at (%d,%d) major=%d -> pass",
+               i, moved ? "swipe" : "hold", s->sx, s->sy, s->smajor);
+    }
 }
 
-static void add_button(struct input_event *out, int *out_count,
-                       const struct input_event *stamp, int code, int value)
+static struct input_event mkabs(const struct input_event *stamp, int code, int value)
 {
-    struct input_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.time = stamp->time;
-    ev.type = EV_KEY;
-    ev.code = code;
-    ev.value = value;
-    out[(*out_count)++] = ev;
+    struct input_event e;
+    memset(&e, 0, sizeof(e));
+    e.time = stamp->time;
+    e.type = EV_ABS;
+    e.code = code;
+    e.value = value;
+    return e;
+}
+
+static struct input_event mkkey(const struct input_event *stamp, int code, int value)
+{
+    struct input_event e;
+    memset(&e, 0, sizeof(e));
+    e.time = stamp->time;
+    e.type = EV_KEY;
+    e.code = code;
+    e.value = value;
+    return e;
 }
 
 /*
- * Build exactly one output frame. With no rejected contact this is a byte-for-
- * byte copy. Otherwise only rejected slots and global touch buttons are masked;
- * the original event order, coordinates and timestamps of allowed slots remain.
+ * Build exactly one output frame. With nothing held or dropped this is a byte
+ * copy of the source frame. A released core contact is replayed at its true
+ * first position, so the gesture keeps its real origin.
  */
-static int finish_frame(const struct input_event *syn,
-                        struct input_event *out, int *out_count)
+static int finish_frame(const struct input_event *syn, struct input_event *out, int *out_count)
 {
     int n = 0, filtered = 0;
-    decide_new_contacts();
+    decide_contacts();
 
+    /* A frame that touches nothing the filter decided against is copied as-is.
+     * Only a frame that really drops something takes over the global buttons.
+     * While any contact is held or dropped the source's global BTN_TOUCH no
+     * longer describes what we forwarded, so those frames are never verbatim. */
     for (int i = 0; i < MAX_SLOTS; i++)
-        if (slots[i].active && slots[i].blocked) filtered = 1;
-    for (int i = 0; i < frame_count; i++)
-        if (frame[i].slot >= 0 && slots[frame[i].slot].blocked) filtered = 1;
+        if (slots[i].state == ST_HELD || slots[i].state == ST_DROP || slots[i].synth)
+            filtered = 1;
+    for (int i = 0; i < frame_count; i++) {
+        struct fev *f = &frame[i];
+        if (f->action == ACT_DROP) filtered = 1;
+        else if (f->action == ACT_PENDING && f->slot >= 0 &&
+                 slots[f->slot].state != ST_PASS) filtered = 1;
+    }
 
     if (!filtered) {
         for (int i = 0; i < frame_count; i++) out[n++] = frame[i].ev;
-        emitted_down = any_allowed_down();
-    } else {
-        for (int i = 0; i < frame_count; i++) {
-            if (frame[i].button || frame[i].slot == -2) continue;
-            if (frame[i].slot >= 0 && slots[frame[i].slot].blocked) continue;
-            out[n++] = frame[i].ev;
+        out[n++] = *syn;
+        emitted_down = any_pass_down();
+        *out_count = n;
+        frame_count = 0;
+        frame_start_slot = cur_slot;
+        return 0;
+    }
+
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        struct slot *s = &slots[i];
+        if (!s->synth) continue;
+        s->synth = 0;
+        out[n++] = mkabs(syn, ABS_MT_SLOT, i);
+        out[n++] = mkabs(syn, ABS_MT_TRACKING_ID, s->tid);
+        for (int a = 0; a < s->n_axes; a++)
+            out[n++] = mkabs(syn, s->axes[a].code, s->axes[a].value);
+        /* the gesture keeps its true origin, then jumps to the live position */
+        out[n++] = mkabs(syn, ABS_MT_POSITION_X, s->sx);
+        out[n++] = mkabs(syn, ABS_MT_POSITION_Y, s->sy);
+        if (s->x != s->sx || s->y != s->sy) {
+            out[n++] = mkabs(syn, ABS_MT_POSITION_X, s->x);
+            out[n++] = mkabs(syn, ABS_MT_POSITION_Y, s->y);
         }
-        int down = any_allowed_down();
-        if (down != emitted_down) {
-            if (has_btn_touch)
-                add_button(out, &n, syn, BTN_TOUCH, down);
-            if (has_tool_finger)
-                add_button(out, &n, syn, BTN_TOOL_FINGER, down);
-            emitted_down = down;
-        }
+        out[n++] = mkabs(syn, ABS_MT_SLOT, frame_start_slot);   /* restore source cursor */
+    }
+
+    for (int i = 0; i < frame_count; i++) {
+        struct fev *f = &frame[i];
+        if (f->button) continue;                 /* global state is ours now */
+        if (f->action == ACT_DROP) continue;
+        if (f->slot == -2) continue;             /* legacy axes: ambiguous once filtered */
+        if (f->action == ACT_PENDING && f->slot >= 0 &&
+            slots[f->slot].state != ST_PASS) continue;
+        out[n++] = f->ev;
+    }
+
+    int down = any_pass_down();
+    if (down != emitted_down) {
+        if (has_btn_touch) out[n++] = mkkey(syn, BTN_TOUCH, down);
+        if (has_tool_finger) out[n++] = mkkey(syn, BTN_TOOL_FINGER, down);
+        emitted_down = down;
     }
     out[n++] = *syn;
     *out_count = n;
     frame_count = 0;
+    frame_start_slot = cur_slot;
     return 0;
 }
 
@@ -306,6 +463,7 @@ static int align_current_slot(void)
     if (read_abs(src_fd, ABS_MT_SLOT, &ai) < 0 ||
         ai.value < 0 || ai.value >= MAX_SLOTS) return -1;
     cur_slot = ai.value;
+    frame_start_slot = cur_slot;
     memset(events, 0, sizeof(events));
     events[0].type = EV_ABS;
     events[0].code = ABS_MT_SLOT;
@@ -505,10 +663,13 @@ static void usage(void)
 {
     fprintf(stderr,
         "usage: edgefilter [--name NAME|-d DEV] [--left N] [--right N]\n"
-        "                  [--top N] [--bottom N] [--major N] [--scale F]\n"
-        "                  [--rot auto|0|90|180|270] [--info]\n"
-        "Complete contacts in an edge band with major >= --major are dropped.\n"
-        "Incomplete contacts pass unchanged; --major 0 drops every complete edge contact.\n");
+        "                  [--top N] [--bottom N] [--major N]\n"
+        "                  [--core-left N] [--core-right N] [--core-top N] [--core-bottom N]\n"
+        "                  [--core-slop N] [--core-hold-ms N]\n"
+        "                  [--scale F] [--rot auto|0|90|180|270] [--info]\n"
+        "Complete contacts in the outer band with major >= --major are dropped.\n"
+        "Core contacts are held: released once they move > --core-slop, dropped if\n"
+        "they lift first. --core-hold-ms 0 disables the core band.\n");
 }
 
 int main(int argc, char **argv)
@@ -529,6 +690,12 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--right") && i + 1 < argc) band_r = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top") && i + 1 < argc) band_t = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bottom") && i + 1 < argc) band_b = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-left") && i + 1 < argc) core_l = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-right") && i + 1 < argc) core_r = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-top") && i + 1 < argc) core_t = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-bottom") && i + 1 < argc) core_b = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-slop") && i + 1 < argc) core_slop = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--core-hold-ms") && i + 1 < argc) core_hold_ms = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--major") && i + 1 < argc) major_min = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
         else if (!strcmp(argv[i], "--info")) info_only = 1;
@@ -538,6 +705,8 @@ int main(int argc, char **argv)
         } else { usage(); return 2; }
     }
     if (band_l < 0 || band_r < 0 || band_t < 0 || band_b < 0 ||
+        core_l < 0 || core_r < 0 || core_t < 0 || core_b < 0 ||
+        core_slop < 0 || core_hold_ms < 0 ||
         major_min < 0 || scale <= 0 || rot < 0 || rot > 3) {
         usage();
         return 2;
@@ -585,11 +754,12 @@ int main(int argc, char **argv)
     write_info();
     logmsg("source %s (%s) panel 0..%d x 0..%d rot=%d scale=%.1f",
            dev, device_name, max_x, max_y, rot * 90, scale);
-    logmsg("bands L=%d R=%d T=%d B=%d px major_min=%d; incomplete=pass; persistent=uinput",
-           band_l, band_r, band_t, band_b, major_min);
+    logmsg("band L=%d R=%d T=%d B=%d major=%d | core L=%d R=%d T=%d B=%d slop=%d hold=%dms%s",
+           band_l, band_r, band_t, band_b, major_min,
+           core_l, core_r, core_t, core_b, core_slop, core_hold_ms,
+           core_active() ? "" : " (disabled)");
     if (info_only) { status = 0; goto out; }
 
-    for (int i = 0; i < MAX_SLOTS; i++) slots[i].decided = 1;
     if (setup_uinput() < 0) {
         logmsg("uinput setup failed: %s", strerror(errno));
         goto out;

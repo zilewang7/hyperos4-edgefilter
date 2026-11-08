@@ -8,11 +8,16 @@ READY=/data/adb/edgefilter/ready
 CTL=/data/adb/modules/edgefilter/ctl.sh
 
 action=""; left=""; right=""; top=""; bottom=""; major=""; since="0"
+cleft=""; cright=""; ctop=""; cbottom=""; cslop=""; chold=""
+
 for kv in $(echo "$1" | tr '&' ' '); do
     k=${kv%%=*}; v=${kv#*=}
     case "$k" in
         action) action="$v" ;; left) left="$v" ;; right) right="$v" ;;
         top) top="$v" ;; bottom) bottom="$v" ;; major) major="$v" ;;
+        coreLeft) cleft="$v" ;; coreRight) cright="$v" ;;
+        coreTop) ctop="$v" ;; coreBottom) cbottom="$v" ;;
+        coreSlop) cslop="$v" ;; coreHold) chold="$v" ;;
         since) since="$v" ;;
     esac
 done
@@ -27,6 +32,9 @@ read_cfg() {
     CFG_LEFT=${BAND_LEFT:-150}; CFG_RIGHT=${BAND_RIGHT:-150}
     CFG_TOP=${BAND_TOP:-0}; CFG_BOTTOM=${BAND_BOTTOM:-0}
     CFG_MAJOR=${MAJOR:-40}; CFG_SCALE=${SCALE:-10}
+    CFG_CLEFT=${CORE_LEFT:-40}; CFG_CRIGHT=${CORE_RIGHT:-40}
+    CFG_CTOP=${CORE_TOP:-0}; CFG_CBOTTOM=${CORE_BOTTOM:-0}
+    CFG_CSLOP=${CORE_SLOP:-12}; CFG_CHOLD=${CORE_HOLD_MS:-200}
 }
 
 status_json() {
@@ -47,9 +55,11 @@ status_json() {
     [ -f "$LOG" ] && total=$(wc -l < "$LOG" 2>/dev/null)
     [ -z "$total" ] && total=0
 
-    printf '{"ok":true,"running":%s,"pid":"%s","device":"%s","panel":{"x":%s,"y":%s},"rot":%s,"log_lines":%s,"config":{"left":%s,"right":%s,"top":%s,"bottom":%s,"major":%s,"scale":%s}}' \
+    printf '{"ok":true,"running":%s,"pid":"%s","device":"%s","panel":{"x":%s,"y":%s},"rot":%s,"log_lines":%s,"config":{"left":%s,"right":%s,"top":%s,"bottom":%s,"major":%s,"coreLeft":%s,"coreRight":%s,"coreTop":%s,"coreBottom":%s,"coreSlop":%s,"coreHold":%s,"scale":%s}}' \
         "$running" "$pid" "$devname" "${panelx:-0}" "${panely:-0}" "${rot:-90}" "${total:-0}" \
-        "$CFG_LEFT" "$CFG_RIGHT" "$CFG_TOP" "$CFG_BOTTOM" "$CFG_MAJOR" "$CFG_SCALE"
+        "$CFG_LEFT" "$CFG_RIGHT" "$CFG_TOP" "$CFG_BOTTOM" "$CFG_MAJOR" \
+        "$CFG_CLEFT" "$CFG_CRIGHT" "$CFG_CTOP" "$CFG_CBOTTOM" "$CFG_CSLOP" "$CFG_CHOLD" \
+        "$CFG_SCALE"
 }
 
 events_json() {
@@ -79,7 +89,9 @@ events_json() {
 }
 
 set_cfg() {
-    for pair in "left:$left" "right:$right" "top:$top" "bottom:$bottom" "major:$major"; do
+    for pair in "left:$left" "right:$right" "top:$top" "bottom:$bottom" "major:$major" \
+                "coreLeft:$cleft" "coreRight:$cright" "coreTop:$ctop" "coreBottom:$cbottom" \
+                "coreSlop:$cslop" "coreHold:$chold"; do
         name=${pair%%:*}; val=${pair#*:}
         [ -z "$val" ] && continue
         is_num "$val" || { printf '{"ok":false,"error":"bad %s"}' "$name"; return; }
@@ -88,13 +100,22 @@ set_cfg() {
     [ -n "$left" ] && CFG_LEFT=$left; [ -n "$right" ] && CFG_RIGHT=$right
     [ -n "$top" ] && CFG_TOP=$top; [ -n "$bottom" ] && CFG_BOTTOM=$bottom
     [ -n "$major" ] && CFG_MAJOR=$major
+    [ -n "$cleft" ] && CFG_CLEFT=$cleft; [ -n "$cright" ] && CFG_CRIGHT=$cright
+    [ -n "$ctop" ] && CFG_CTOP=$ctop; [ -n "$cbottom" ] && CFG_CBOTTOM=$cbottom
+    [ -n "$cslop" ] && CFG_CSLOP=$cslop; [ -n "$chold" ] && CFG_CHOLD=$chold
 
     tmp="$CFG.tmp.$$"
     sed -e "s/^BAND_LEFT=.*/BAND_LEFT=$CFG_LEFT/" \
         -e "s/^BAND_RIGHT=.*/BAND_RIGHT=$CFG_RIGHT/" \
         -e "s/^BAND_TOP=.*/BAND_TOP=$CFG_TOP/" \
         -e "s/^BAND_BOTTOM=.*/BAND_BOTTOM=$CFG_BOTTOM/" \
-        -e "s/^MAJOR=.*/MAJOR=$CFG_MAJOR/" "$CFG" > "$tmp" || {
+        -e "s/^MAJOR=.*/MAJOR=$CFG_MAJOR/" \
+        -e "s/^CORE_LEFT=.*/CORE_LEFT=$CFG_CLEFT/" \
+        -e "s/^CORE_RIGHT=.*/CORE_RIGHT=$CFG_CRIGHT/" \
+        -e "s/^CORE_TOP=.*/CORE_TOP=$CFG_CTOP/" \
+        -e "s/^CORE_BOTTOM=.*/CORE_BOTTOM=$CFG_CBOTTOM/" \
+        -e "s/^CORE_SLOP=.*/CORE_SLOP=$CFG_CSLOP/" \
+        -e "s/^CORE_HOLD_MS=.*/CORE_HOLD_MS=$CFG_CHOLD/" "$CFG" > "$tmp" || {
         rm -f "$tmp"; printf '{"ok":false,"error":"config write"}'; return;
     }
     chmod 644 "$tmp"
