@@ -34,10 +34,15 @@ v0.10 改成**反方向**：核心带里的触点**先扣住不发**，动了才
 - 没有 `SYN_DROPPED`
 - 没有合成取消
 - 没有幽灵触点
-- 补发的 `DOWN` 用的是**真实起手坐标**，不是当前坐标，所以不漂移
+- 补发的 `DOWN` 单独占一帧，用的是**真实起手坐标**，所以不漂移
 
 代价只有一个：核心带内的**滑动起手会晚 1~2 帧（约 8~16ms）**，因为要先确认手指确实在动。
 实测侧滑返回、上滑回桌面均正常。
+
+> 补发的 `DOWN` 必须**单独占一帧**。`InputReader` 每个 `SYN_REPORT` 只产生一个
+> `MotionEvent`，如果把「起手点 + 当前点」塞进同一帧，系统只会看到当前点 ——
+> `ACTION_DOWN` 就落在已经离开边缘的位置，返回手势不会触发。
+> 这一点由 `tests/protocol_test.c` 断言保护。
 
 ## 原理
 
@@ -63,7 +68,7 @@ goodix_ts (event5)
 | `BTN_TOUCH` / `BTN_TOOL_FINGER` 只由**实际输出的触点**决定 | 不盲传源设备全局按键 |
 | 被丢弃的触点：零 `DOWN`、零坐标、零 legacy 轴 | 不泄漏任何痕迹 |
 | 一个放行触点恰好一个 `DOWN`、一个 `UP` | 不重复、不丢失 |
-| 补发的 `DOWN` 位于真实起手坐标，且先于实时坐标 | 手势起点不漂移 |
+| 补发的 `DOWN` 独占一帧且位于真实起手坐标 | `ACTION_DOWN` 落在边缘，返回手势能识别 |
 | 首帧缺坐标或面积 → **放行** | 绝不用旧值猜、绝不延迟 |
 | 写入失败 / 源 `SYN_DROPPED` / 帧溢出 → **退出并恢复原生** | 绝不带着失真状态继续独占面板 |
 | `grabbed` ⇒ 虚拟设备已就绪 | 不会出现「抓住面板但没输出」 |
@@ -139,8 +144,8 @@ InputReader 与触摸 IC 的模式状态，是「亮屏后触摸无响应」的�
 命令行装法：
 
 ```bash
-adb push edgefilter-v0.10.zip /data/local/tmp/
-adb shell 'su -c "ksud module install /data/local/tmp/edgefilter-v0.10.zip"'
+adb push edgefilter-v0.10.1.zip /data/local/tmp/
+adb shell 'su -c "ksud module install /data/local/tmp/edgefilter-v0.10.1.zip"'
 ```
 
 > **免解锁越狱（CVE 临时 root）注意**：KSU 的 `service.sh` 只在开机阶段执行，

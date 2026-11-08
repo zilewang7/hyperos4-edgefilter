@@ -251,7 +251,22 @@ static void test_core_swipe_released_at_origin(void)
     CHECK(count(EV_ABS, ABS_MT_POSITION_Y, 4000, 1) == 1, "live position must follow the origin");
     CHECK(count(EV_ABS, ABS_MT_TOUCH_MAJOR, 22, 1) == 1, "first-frame area must be replayed");
     CHECK(count(EV_KEY, BTN_TOUCH, 1, 1) == 1, "BTN_TOUCH must accompany the released contact");
-    CHECK(count(EV_SYN, SYN_REPORT, 0, 0) == 1, "one frame, one SYN_REPORT");
+    /* the DOWN must be its own frame: InputReader emits one MotionEvent per
+     * SYN_REPORT, so ACTION_DOWN has to land at the origin, not the live point */
+    CHECK(count(EV_SYN, SYN_REPORT, 0, 0) == 2, "release must span a DOWN frame and a move frame");
+
+    int first_syn = -1;
+    for (int i = 0; i < out_n; i++)
+        if (out[i].type == EV_SYN && out[i].code == SYN_REPORT) { first_syn = i; break; }
+    CHECK(first_syn > 0, "missing DOWN frame terminator");
+    int origin_before = 1, live_after = 0;
+    for (int i = 0; i < out_n; i++) {
+        if (out[i].type != EV_ABS || out[i].code != ABS_MT_POSITION_Y) continue;
+        if (out[i].value == 200 && i > first_syn) origin_before = 0;
+        if (out[i].value == 4000 && i > first_syn) live_after = 1;
+    }
+    CHECK(origin_before, "origin must be inside the DOWN frame");
+    CHECK(live_after, "live position must come after the DOWN frame");
 
     /* the origin must be replayed before the live position */
     int origin_at = -1, live_at = -1;

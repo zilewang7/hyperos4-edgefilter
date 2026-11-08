@@ -40,7 +40,7 @@
 #define MAX_SLOTS 16
 #define MAX_FRAME 1024
 #define MAX_MT_AXES 8
-#define OUT_CAP (MAX_FRAME + 3 * MAX_SLOTS + 4)
+#define OUT_CAP (MAX_FRAME + MAX_SLOTS * 12 + 8)
 #define NLONGS(n) (((n) + (int)(8 * sizeof(long)) - 1) / (int)(8 * sizeof(long)))
 #define BIT_TEST(bits, n) (((bits)[(n) / (8 * sizeof(long))] >> ((n) % (8 * sizeof(long)))) & 1UL)
 
@@ -80,6 +80,8 @@ struct slot {
     long long held_ms;
     struct mt_axis axes[MAX_MT_AXES];
     int n_axes;
+    struct timeval down_time;   /* when the contact really began */
+    int released;               /* held contact released in the current frame */
 };
 
 struct fev {
@@ -250,6 +252,8 @@ static int handle_event(const struct input_event *ev)
         s->synth = 0;
         s->n_axes = 0;
         s->held_ms = 0;
+        s->released = 0;
+        s->down_time = ev->time;
         new_slots[new_count++] = cur_slot;
         return add_event(ev, cur_slot, ACT_PENDING, 0);
     }
@@ -263,6 +267,7 @@ static int handle_event(const struct input_event *ev)
         s->state = ST_EMPTY;
         s->pending_new = 0;
         s->synth = 0;
+        s->released = 0;
         return add_event(ev, cur_slot, action, 0);
     }
 
@@ -333,6 +338,7 @@ static void decide_contacts(void)
         if (!moved && !expired) continue;
         s->state = ST_PASS;
         s->synth = 1;
+        s->released = 1;
         logmsg("slot %d core %s at (%d,%d) major=%d -> pass",
                i, moved ? "swipe" : "hold", s->sx, s->sy, s->smajor);
     }
@@ -391,38 +397,54 @@ static int finish_frame(const struct input_event *syn, struct input_event *out, 
         *out_count = n;
         frame_count = 0;
         frame_start_slot = cur_slot;
+        for (int i = 0; i < MAX_SLOTS; i++) slots[i].released = 0;
         return 0;
     }
 
+    /*
+     * A released contact is announced in its own frame, stamped with the moment
+     * the finger really landed. InputReader turns one SYN_REPORT into exactly
+     * one MotionEvent, so folding "origin + live position" into a single frame
+     * would make ACTION_DOWN land at the live position - already past the edge,
+     * and the system back gesture would not start.
+     */
+    int down = any_pass_down();
     for (int i = 0; i < MAX_SLOTS; i++) {
         struct slot *s = &slots[i];
         if (!s->synth) continue;
         s->synth = 0;
-        out[n++] = mkabs(syn, ABS_MT_SLOT, i);
-        out[n++] = mkabs(syn, ABS_MT_TRACKING_ID, s->tid);
+
+        struct input_event at = {0};
+        at.time = s->down_time;
+        out[n++] = mkabs(&at, ABS_MT_SLOT, i);
+        out[n++] = mkabs(&at, ABS_MT_TRACKING_ID, s->tid);
         for (int a = 0; a < s->n_axes; a++)
-            out[n++] = mkabs(syn, s->axes[a].code, s->axes[a].value);
-        /* the gesture keeps its true origin, then jumps to the live position */
-        out[n++] = mkabs(syn, ABS_MT_POSITION_X, s->sx);
-        out[n++] = mkabs(syn, ABS_MT_POSITION_Y, s->sy);
-        if (s->x != s->sx || s->y != s->sy) {
-            out[n++] = mkabs(syn, ABS_MT_POSITION_X, s->x);
-            out[n++] = mkabs(syn, ABS_MT_POSITION_Y, s->y);
+            out[n++] = mkabs(&at, s->axes[a].code, s->axes[a].value);
+        out[n++] = mkabs(&at, ABS_MT_POSITION_X, s->sx);
+        out[n++] = mkabs(&at, ABS_MT_POSITION_Y, s->sy);
+        if (down != emitted_down) {
+            if (has_btn_touch) out[n++] = mkkey(&at, BTN_TOUCH, down);
+            if (has_tool_finger) out[n++] = mkkey(&at, BTN_TOOL_FINGER, down);
+            emitted_down = down;
         }
-        out[n++] = mkabs(syn, ABS_MT_SLOT, frame_start_slot);   /* restore source cursor */
+        out[n++] = at;                      /* SYN_REPORT, zeroed except time */
+        out[n++] = mkabs(&at, ABS_MT_SLOT, frame_start_slot);   /* restore source cursor */
     }
 
     for (int i = 0; i < frame_count; i++) {
         struct fev *f = &frame[i];
         if (f->button) continue;                 /* global state is ours now */
-        if (f->action == ACT_DROP) continue;
         if (f->slot == -2) continue;             /* legacy axes: ambiguous once filtered */
-        if (f->action == ACT_PENDING && f->slot >= 0 &&
-            slots[f->slot].state != ST_PASS) continue;
+        if (f->action == ACT_DROP) {
+            /* a contact released in this very frame carries real motion */
+            if (f->slot < 0 || !slots[f->slot].released) continue;
+        } else if (f->action == ACT_PENDING && f->slot >= 0 &&
+                   slots[f->slot].state != ST_PASS) {
+            continue;
+        }
         out[n++] = f->ev;
     }
 
-    int down = any_pass_down();
     if (down != emitted_down) {
         if (has_btn_touch) out[n++] = mkkey(syn, BTN_TOUCH, down);
         if (has_tool_finger) out[n++] = mkkey(syn, BTN_TOOL_FINGER, down);
@@ -432,6 +454,7 @@ static int finish_frame(const struct input_event *syn, struct input_event *out, 
     *out_count = n;
     frame_count = 0;
     frame_start_slot = cur_slot;
+    for (int i = 0; i < MAX_SLOTS; i++) slots[i].released = 0;
     return 0;
 }
 

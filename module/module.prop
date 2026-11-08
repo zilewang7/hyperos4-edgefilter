@@ -1,6 +1,6 @@
 id=edgefilter
 name=EdgeFilter 边缘防误触
-version=0.10
-versionCode=10
+version=0.10.1
+versionCode=11
 author=zilewang7
 description=用户态边缘触控过滤：EVIOCGRAB 抓取真实触控设备，丢弃落点在边缘带内的误触，经 uinput 重新注入。给触控固件不支持原生 edge suppression 的机型（如 Xiaomi Pad 7 Ultra / jinghu）补上边缘防误触。
