@@ -37,7 +37,7 @@ step() { echo "· $*"; }
 # ============================================================ 一致性校验
 step "校验模块文件"
 
-for f in module.prop service.sh ctl.sh watch.sh web.sh api.sh action.sh \
+for f in module.prop service.sh ctl.sh web.sh api.sh action.sh \
          uninstall.sh config; do
     [ -f "module/$f" ] || fail "缺少 module/$f"
 done
@@ -63,6 +63,21 @@ for k in id name version versionCode; do
 done
 grep -q "^version=${VERSION}$" module/module.prop || fail "版本号解析异常"
 step "  版本 v${VERSION} (versionCode ${VCODE})"
+
+# 触控协议回归测试：宿主编译，不需要设备
+if command -v cc >/dev/null 2>&1; then
+    cc -std=gnu11 -w -o /tmp/edgefilter-protocol-test tests/protocol_test.c \
+        || fail "协议测试编译失败"
+    if /tmp/edgefilter-protocol-test 2>&1 | grep -q ' 0 failures'; then
+        step "  协议回归测试通过"
+    else
+        /tmp/edgefilter-protocol-test 2>&1 | tail -n 20 >&2
+        fail "协议回归测试失败"
+    fi
+    rm -f /tmp/edgefilter-protocol-test
+else
+    step "  跳过协议测试（没有宿主 cc）"
+fi
 
 if [ "$CHECK_ONLY" = "1" ]; then
     echo

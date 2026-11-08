@@ -1,11 +1,10 @@
 /*
- * edgefilter v2 - userspace edge touch filter for Android touchscreens
+ * EdgeFilter: a deliberately small evdev -> uinput contact filter.
  *
- * Grabs the real touchscreen (EVIOCGRAB), drops contacts whose FIRST touch
- * point falls inside a configurable edge band, and re-emits everything else
- * through a uinput virtual multitouch device (protocol B).
- *
- * Root required. Build: aarch64-linux-android26-clang -static -O2
+ * A new contact is judged once, at its first SYN_REPORT. Complete edge grips
+ * are dropped for their whole lifetime; every other contact is passed through
+ * unchanged. There is no delayed DOWN, synthetic CANCEL, or screen lifecycle.
+ * Any stream/write error is fatal: closing the descriptors restores native touch.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -18,62 +17,57 @@
 #include <errno.h>
 #include <signal.h>
 #include <poll.h>
-#include <time.h>
 #include <dirent.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
+#include <sys/prctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 
-#define MAX_SLOTS   16
-#define MAX_FRAME   1024
+#define MAX_SLOTS 16
+#define MAX_FRAME 1024
+#define OUT_CAP (MAX_FRAME + 3)
+#define NLONGS(n) (((n) + (int)(8 * sizeof(long)) - 1) / (int)(8 * sizeof(long)))
+#define BIT_TEST(bits, n) (((bits)[(n) / (8 * sizeof(long))] >> ((n) % (8 * sizeof(long)))) & 1UL)
 
-static volatile sig_atomic_t g_stop = 0;
-static volatile sig_atomic_t g_on = 0;      /* SIGHUP  : screen turned on  */
-static volatile sig_atomic_t g_off = 0;     /* SIGUSR1 : screen turned off */
-static volatile sig_atomic_t g_rot = 0;     /* SIGUSR2 : 配置变了，重读旋转 */
-static void on_sig(int s) { (void)s; g_stop = 1; }
-static void on_hup(int s) { (void)s; g_on = 1; }
-static void on_usr1(int s) { (void)s; g_off = 1; }
-static void on_usr2(int s) { (void)s; g_rot = 1; }
+#define SEEN_X 1
+#define SEEN_Y 2
+#define SEEN_MAJOR 4
 
-static int grabbed = 0;                     /* EVIOCGRAB currently held */
+static volatile sig_atomic_t g_stop;
+static int src_fd = -1, ui_fd = -1, lock_fd = -1;
+static pid_t monitor_pid = -1;
 
-static char g_name[UINPUT_MAX_NAME_SIZE] = {0};
-static int g_bus, g_vendor, g_product, g_version;
-
-static int src_fd = -1;
-static int ui_fd  = -1;
+static char device_name[64];
+static struct input_id device_id;
+static int max_x, max_y;
+static int band_l, band_r, band_t, band_b;
+static int major_min = 40;
+static double scale = 10.0;
+static int rot = 1;
+static int has_btn_touch, has_tool_finger;
 
 struct slot {
-    int active, blocked, new_in_frame, x, y, have_x, have_y, major;
-    int undecided;   /* 坐标还没到齐，先扣住不判 */
-    int wait;        /* 已经等了几个 SYN 帧 */
-    int held;        /* 是否被扣住过（需要补发 DOWN） */
-    /* 核心带延后判定：先挂起，移动超过 slop 当手势放行，原地抬手当点击拦截 */
-    int pending, sx, sy, smajor, tid, synth;
+    int active;
+    int decided;
+    int blocked;
+    int x, y, major;
+    unsigned seen;
 };
+
+struct fev {
+    struct input_event ev;
+    int slot;                  /* -1: not slot-specific */
+    int button;                /* BTN_TOUCH / BTN_TOOL_FINGER */
+};
+
 static struct slot slots[MAX_SLOTS];
-static int cur_slot = 0;
-
-struct fev { struct input_event ev; int slot; int btn; int pass; };
+static int new_slots[MAX_SLOTS], new_count;
 static struct fev frame[MAX_FRAME];
-static int frame_n = 0;
-static int emitted_down = 0;
-static int ui_dead = 0;          /* uinput device gone -> recreate */
-static int n_keys = 0, n_abs = 0;
-static unsigned long g_dropped = 0;
-static int g_cancel = 0;        /* 下一帧发 SYN_DROPPED，把这次触摸取消掉 */
-
-/* config */
-static int band_l = 0, band_r = 0, band_t = 0, band_b = 0;   /* logical px */
-static int core_l = 0, core_r = 0, core_t = 0, core_b = 0;   /* logical px */
-static int core_slop = 12;                                   /* logical px, 0 = 核心带全拦 */
-static double scale = 10.0;                                  /* raw units per px */
-static int rot = 1;                                          /* 0..3 -> 0/90/180/270 */
-static int major_min = 0;
-static int max_x = 0, max_y = 0;
-static int verbose = 0;
-static int dry_run = 0;
+static int frame_count, cur_slot;
+static int emitted_down;
 
 static void logmsg(const char *fmt, ...)
 {
@@ -81,373 +75,221 @@ static void logmsg(const char *fmt, ...)
     va_start(ap, fmt);
     fprintf(stderr, "[edgefilter] ");
     vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
+    fputc('\n', stderr);
     va_end(ap);
     fflush(stderr);
 }
 
-/* 整帧批量写：一个 write() 把整帧交给 uinput。
- * 原来每个事件一次 write，一帧动辄 20+ 次系统调用，忙的时候读 event5 跟不上，
- * 内核就会往我们这边注入 SYN_DROPPED。 */
-static struct input_event obuf[MAX_FRAME * 2];
-static int obuf_n = 0;
-
-static void flush_out(void)
+static void on_stop(int sig)
 {
-    if (obuf_n == 0) return;
-    int n = obuf_n;
-    obuf_n = 0;
-    if (dry_run || ui_fd < 0) return;
-    ssize_t w = write(ui_fd, obuf, (size_t)n * sizeof(struct input_event));
-    if (w < 0 && errno != EAGAIN) {
-        logmsg("uinput write failed: %s", strerror(errno));
-        if (errno == ENODEV) ui_dead = 1;
+    (void)sig;
+    g_stop = 1;
+}
+
+static int in_band(int x, int y)
+{
+    double l = band_l * scale, r = band_r * scale;
+    double t = band_t * scale, b = band_b * scale;
+
+    switch (rot) {
+    case 0:
+        return (l > 0 && x < l) || (r > 0 && x > max_x - r) ||
+               (t > 0 && y < t) || (b > 0 && y > max_y - b);
+    case 1:
+        return (l > 0 && y < l) || (r > 0 && y > max_y - r) ||
+               (t > 0 && x > max_x - t) || (b > 0 && x < b);
+    case 2:
+        return (l > 0 && x > max_x - l) || (r > 0 && x < r) ||
+               (t > 0 && y > max_y - t) || (b > 0 && y < b);
+    default:
+        return (l > 0 && y > max_y - l) || (r > 0 && y < r) ||
+               (t > 0 && x < t) || (b > 0 && x > max_x - b);
     }
 }
 
-static void ui_write(const struct input_event *ev)
+static int add_event(const struct input_event *ev, int slot, int button)
 {
-    if (dry_run || ui_fd < 0) return;
-    if (obuf_n >= (int)(sizeof(obuf) / sizeof(obuf[0]))) flush_out();
-    if (obuf_n >= (int)(sizeof(obuf) / sizeof(obuf[0]))) return;
-    obuf[obuf_n++] = *ev;
+    if (frame_count >= MAX_FRAME) {
+        logmsg("input frame overflow; disabling filter");
+        return -1;
+    }
+    frame[frame_count].ev = *ev;
+    frame[frame_count].slot = slot;
+    frame[frame_count].button = button;
+    frame_count++;
+    return 0;
 }
 
-static void emit(int type, int code, int value)
+/* Returns 0 on success. A malformed/dropped source frame is deliberately fatal. */
+static int handle_event(const struct input_event *ev)
+{
+    if (ev->type == EV_SYN) {
+        if (ev->code == SYN_DROPPED) {
+            logmsg("source SYN_DROPPED; disabling filter instead of guessing state");
+            return -1;
+        }
+        return add_event(ev, -1, 0);
+    }
+
+    if (ev->type == EV_KEY) {
+        int button = (ev->code == BTN_TOUCH || ev->code == BTN_TOOL_FINGER);
+        return add_event(ev, -1, button);
+    }
+
+    if (ev->type != EV_ABS)
+        return add_event(ev, -1, 0);
+
+    if (ev->code == ABS_X || ev->code == ABS_Y) {
+        /* Global legacy axes may describe a rejected MT contact. */
+        return add_event(ev, -2, 0);
+    }
+
+    if (ev->code == ABS_MT_SLOT) {
+        if (ev->value < 0 || ev->value >= MAX_SLOTS) {
+            logmsg("invalid source slot %d; disabling filter", ev->value);
+            return -1;
+        }
+        cur_slot = ev->value;
+        /* Keep slot selections: omitting them would change subsequent event routing. */
+        return add_event(ev, -1, 0);
+    }
+
+    switch (ev->code) {
+    case ABS_MT_TRACKING_ID:
+    case ABS_MT_POSITION_X:
+    case ABS_MT_POSITION_Y:
+    case ABS_MT_TOUCH_MAJOR:
+    case ABS_MT_WIDTH_MAJOR:
+    case ABS_MT_WIDTH_MINOR:
+        break;
+    default:
+        return add_event(ev, cur_slot, 0);
+    }
+
+    struct slot *s = &slots[cur_slot];
+    switch (ev->code) {
+    case ABS_MT_TRACKING_ID:
+        if (ev->value >= 0) {
+            if (s->active || !s->decided) {
+                logmsg("invalid DOWN on slot %d; disabling filter", cur_slot);
+                return -1;
+            }
+            if (new_count >= MAX_SLOTS) return -1;
+            s->active = 1;
+            s->decided = 0;   /* also marks an unjudged DOWN in this frame */
+            s->blocked = 0;
+            s->x = s->y = s->major = -1;
+            s->seen = 0;
+            new_slots[new_count++] = cur_slot;
+        } else {
+            s->active = 0;
+        }
+        break;
+    case ABS_MT_POSITION_X:
+        if (!s->decided) { s->x = ev->value; s->seen |= SEEN_X; }
+        break;
+    case ABS_MT_POSITION_Y:
+        if (!s->decided) { s->y = ev->value; s->seen |= SEEN_Y; }
+        break;
+    case ABS_MT_TOUCH_MAJOR:
+        if (!s->decided) { s->major = ev->value; s->seen |= SEEN_MAJOR; }
+        break;
+    }
+    return add_event(ev, cur_slot, 0);
+}
+
+static int any_allowed_down(void)
+{
+    for (int i = 0; i < MAX_SLOTS; i++)
+        if (slots[i].active && !slots[i].blocked) return 1;
+    return 0;
+}
+
+static void decide_new_contacts(void)
+{
+    for (int n = 0; n < new_count; n++) {
+        struct slot *s = &slots[new_slots[n]];
+        int complete = (s->seen & (SEEN_X | SEEN_Y)) == (SEEN_X | SEEN_Y);
+        int edge = complete && in_band(s->x, s->y);
+        int area_known = (s->seen & SEEN_MAJOR) != 0;
+
+        /* Fail open: never judge with a stale axis or an assumed contact area. */
+        s->blocked = edge && (major_min == 0 || (area_known && s->major >= major_min));
+        s->decided = 1;
+
+        const char *result = s->blocked ? "BLOCKED" : "pass";
+        const char *reason = !complete || (edge && major_min > 0 && !area_known)
+                           ? "incomplete" : s->blocked ? "grip" : edge ? "area" : "outside";
+        logmsg("slot %d new contact at (%d,%d) major=%d -> %s %s",
+               new_slots[n], s->x, s->y, s->major, result, reason);
+    }
+    new_count = 0;
+}
+
+static void add_button(struct input_event *out, int *out_count,
+                       const struct input_event *stamp, int code, int value)
 {
     struct input_event ev;
     memset(&ev, 0, sizeof(ev));
-    ev.type = type; ev.code = code; ev.value = value;
-    ui_write(&ev);
+    ev.time = stamp->time;
+    ev.type = EV_KEY;
+    ev.code = code;
+    ev.value = value;
+    out[(*out_count)++] = ev;
 }
 
-/* rotation-aware edge test; l/r/t/b are logical px on the four screen edges */
-static int in_edges(int x, int y, int l, int r, int t, int b)
+/*
+ * Build exactly one output frame. With no rejected contact this is a byte-for-
+ * byte copy. Otherwise only rejected slots and global touch buttons are masked;
+ * the original event order, coordinates and timestamps of allowed slots remain.
+ */
+static int finish_frame(const struct input_event *syn,
+                        struct input_event *out, int *out_count)
 {
-    int L = (int)(l * scale), R = (int)(r * scale);
-    int T = (int)(t * scale), B = (int)(b * scale);
-    switch (rot) {
-    case 0:  /* portrait */
-        return (L > 0 && x < L) || (R > 0 && x > max_x - R) ||
-               (T > 0 && y < T) || (B > 0 && y > max_y - B);
-    case 1:  /* 90: screen-left = panel y-min, screen-top = panel x-max */
-        return (L > 0 && y < L) || (R > 0 && y > max_y - R) ||
-               (T > 0 && x > max_x - T) || (B > 0 && x < B);
-    case 2:  /* 180 */
-        return (L > 0 && x > max_x - L) || (R > 0 && x < R) ||
-               (T > 0 && y > max_y - T) || (B > 0 && y < B);
-    default: /* 270 */
-        return (L > 0 && y > max_y - L) || (R > 0 && y < R) ||
-               (T > 0 && x < T) || (B > 0 && x > max_x - B);
-    }
-}
+    int n = 0, filtered = 0;
+    decide_new_contacts();
 
-/* outer band: area-based filtering (edge grip) */
-static int in_zone(int x, int y)
-{
-    return in_edges(x, y, band_l, band_r, band_t, band_b);
-}
-
-/* inner "core" band: block anything that starts here, area ignored */
-static int in_core(int x, int y)
-{
-    return in_edges(x, y, core_l, core_r, core_t, core_b);
-}
-
-static int active_unblocked(void)
-{
-    int n = 0;
     for (int i = 0; i < MAX_SLOTS; i++)
-        if (slots[i].active && !slots[i].blocked) n++;
-    return n;
-}
+        if (slots[i].active && slots[i].blocked) filtered = 1;
+    for (int i = 0; i < frame_count; i++)
+        if (frame[i].slot >= 0 && slots[frame[i].slot].blocked) filtered = 1;
 
-static void reset_silent(void)
-{
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        slots[i].active = 0; slots[i].blocked = 0;
-        slots[i].have_x = 0; slots[i].have_y = 0;
-        slots[i].new_in_frame = 0; slots[i].major = 0;
-        slots[i].pending = 0; slots[i].synth = 0;
-        slots[i].undecided = 0; slots[i].wait = 0; slots[i].held = 0;
-    }
-    frame_n = 0;
-    cur_slot = 0;
-    emitted_down = 0;
-    obuf_n = 0;
-}
-
-static void reset_state(void)
-{
-    /* lift every contact the virtual device still holds, so InputReader can
-     * never be left with a phantom finger down */
-    int any = 0;
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        if (slots[i].active) {
-            emit(EV_ABS, ABS_MT_SLOT, i);
-            emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
-            any = 1;
-        }
-        slots[i].active = 0;
-        slots[i].blocked = 0;
-        slots[i].have_x = 0;
-        slots[i].have_y = 0;
-        slots[i].undecided = 0;
-        slots[i].new_in_frame = 0;
-        slots[i].major = 0;
-        slots[i].pending = 0;
-        slots[i].synth = 0;
-    }
-    if (emitted_down) {
-        emit(EV_KEY, BTN_TOUCH, 0);
-        emit(EV_KEY, BTN_TOOL_FINGER, 0);
-        emitted_down = 0;
-        any = 1;
-    }
-    if (any) emit(EV_SYN, SYN_REPORT, 0);
-    flush_out();
-    frame_n = 0;
-    cur_slot = 0;
-}
-
-static void flush_frame(void)
-{
-    if (g_cancel) {
-        /* 核心带里原地点击：用 SYN_DROPPED 让 Android 取消这次触摸。
-         * 应用收到 ACTION_CANCEL，不会触发点击；同时因为 DOWN 是立刻转发出去的，
-         * 侧滑/上滑这些手势完全不受影响。 */
-        g_cancel = 0;
-        frame_n = 0;
-        emit(EV_SYN, SYN_DROPPED, 0);
-        flush_out();
-        reset_silent();
-        return;
-    }
-
-    if (frame_n == 0) { emit(EV_SYN, SYN_REPORT, 0); flush_out(); return; }
-
-    int wrote = 0;
-
-    /* 1. pass-through events first: KEY_WAKEUP (double-tap gesture), ABS_X/Y,
-     *    SYN_DROPPED, ...  These must never be filtered. */
-    for (int i = 0; i < frame_n; i++) {
-        if (!frame[i].pass) continue;
-        ui_write(&frame[i].ev);
-        wrote = 1;
-    }
-
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        if (!slots[i].new_in_frame) continue;
-
-        /* 面板常常先报 POSITION_X，POSITION_Y 晚 1~4 帧才来。
-         * 坐标没到齐就做判定，会拿上一个触点的残留值当坐标 —— 时对时错。
-         * 所以这里先扣住，等两个轴都到齐再判。 */
-        if (slots[i].undecided) {
-            if (!slots[i].have_x || !slots[i].have_y) {
-                if (slots[i].wait < 3) {
-                    slots[i].wait++;
-                    slots[i].held = 1;     /* 记住扣过，放行时要补 DOWN */
-                    slots[i].blocked = 1;  /* 扣住，不转发 */
-                    continue;              /* new_in_frame 保持，下帧再判 */
-                }
-                /* 等了 3 帧还不齐，就用现有值判，不能无限期扣着 */
-            }
-            slots[i].undecided = 0;
-        }
-
-        int blocked = 0;
-        const char *why = "pass";
-        if (in_core(slots[i].x, slots[i].y)) {
-            if (core_slop > 0) {
-                /* 核心带：立刻放行，但记下来。如果它一直没怎么动就抬手，
-                 * 说明是原地误触 —— 到抬手时用 SYN_DROPPED 取消掉。
-                 * 这样手势拿到的是零延迟的真实 DOWN，点击又不会生效。 */
-                slots[i].pending = 1;
-                slots[i].sx = slots[i].x;
-                slots[i].sy = slots[i].y;
-                slots[i].smajor = slots[i].major;
-                blocked = 0; why = "core";
-            } else {
-                blocked = 1; why = "BLOCKED core";
-            }
-        } else if (in_zone(slots[i].x, slots[i].y)) {
-            if (major_min > 0) {
-                blocked = (slots[i].major >= major_min);  /* 贴边握持才拦 */
-                why = blocked ? "BLOCKED grip" : "pass";
-            } else {
-                blocked = 1;                              /* block everything in band */
-                why = "BLOCKED band";
-            }
-        }
-        slots[i].blocked = blocked;
-        if (!blocked && slots[i].held) {
-            /* 前面被扣住的 DOWN 要补发，否则 Android 永远看不到这次触摸。
-             * 没被扣过的不要补，否则会多发一次 TRACKING_ID。 */
-            slots[i].sx = slots[i].x;
-            slots[i].sy = slots[i].y;
-            slots[i].synth = 1;
-            slots[i].held = 0;
-        }
-        slots[i].new_in_frame = 0;
-        if (strcmp(why, "core?") != 0)
-            logmsg("slot %d new contact at (%d,%d) major=%d -> %s",
-                   i, slots[i].x, slots[i].y, slots[i].major, why);
-    }
-
-    int active = active_unblocked();
-
-    if (!emitted_down && active > 0) {
-        emit(EV_KEY, BTN_TOUCH, 1);
-        emit(EV_KEY, BTN_TOOL_FINGER, 1);
-        emitted_down = 1; wrote = 1;
-    }
-
-    /* 核心带里被放行的触点：补一个 DOWN，位置用它最初的落点，
-     * 这样手势识别器看到的起点和真实起手点一致。 */
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        if (!slots[i].synth) continue;
-        emit(EV_ABS, ABS_MT_SLOT, i);
-        emit(EV_ABS, ABS_MT_TRACKING_ID, slots[i].tid);
-        emit(EV_ABS, ABS_MT_POSITION_X, slots[i].sx);
-        emit(EV_ABS, ABS_MT_POSITION_Y, slots[i].sy);
-        slots[i].synth = 0;
-        wrote = 1;
-    }
-    for (int i = 0; i < frame_n; i++) {
-        struct fev *f = &frame[i];
-        if (f->pass || f->btn) continue;
-        if (f->slot >= 0 && slots[f->slot].blocked) continue;
-        ui_write(&f->ev);
-        wrote = 1;
-    }
-    if (emitted_down && active == 0) {
-        emit(EV_KEY, BTN_TOUCH, 0);
-        emit(EV_KEY, BTN_TOOL_FINGER, 0);
-        emitted_down = 0; wrote = 1;
-    }
-    if (wrote) emit(EV_SYN, SYN_REPORT, 0);
-    flush_out();
-
-    for (int i = 0; i < MAX_SLOTS; i++) {
-        slots[i].new_in_frame = 0;
-        if (!slots[i].active) slots[i].blocked = 0;
-    }
-    frame_n = 0;
-}
-
-static void add_pass(const struct input_event *ev)
-{
-    if (frame_n >= MAX_FRAME) return;
-    frame[frame_n].ev = *ev;
-    frame[frame_n].slot = -1;
-    frame[frame_n].btn = 0;
-    frame[frame_n].pass = 1;
-    frame_n++;
-}
-
-static void handle_event(const struct input_event *ev)
-{
-    if (ev->type == EV_SYN) {
-        if (ev->code == SYN_REPORT) { flush_frame(); return; }
-        if (ev->code == SYN_DROPPED) {
-            /* 内核 evdev 缓冲溢出（我们读慢了）。绝对不能原样转发给 Android：
-             * InputReader 收到 SYN_DROPPED 会把正在进行的触摸 CANCEL 掉，
-             * 侧滑返回就是这样被掐断的。这里只重同步自己的状态。 */
-            g_dropped++;
-            logmsg("SYN_DROPPED from source (#%d) -> resync", g_dropped);
-            reset_state();
-            return;
-        }
-        add_pass(ev);
-        return;
-    }
-
-    int slot = -1, btn = 0;
-    if (ev->type == EV_ABS) {
-        switch (ev->code) {
-        case ABS_MT_SLOT:
-            if (ev->value >= 0 && ev->value < MAX_SLOTS) cur_slot = ev->value;
-            break;
-        case ABS_MT_TRACKING_ID:
-            if (ev->value >= 0) {
-                slots[cur_slot].active = 1;
-                slots[cur_slot].new_in_frame = 1;
-                slots[cur_slot].have_x = 0;
-                slots[cur_slot].have_y = 0;
-                slots[cur_slot].undecided = 1;   /* 等两个坐标到齐 */
-                slots[cur_slot].wait = 0;
-                slots[cur_slot].held = 0;
-                slots[cur_slot].x = 0;
-                slots[cur_slot].y = 0;
-                slots[cur_slot].blocked = 1;     /* 未定之前一律扣住 */
-                slots[cur_slot].major = 0;
-                slots[cur_slot].pending = 0;
-                slots[cur_slot].synth = 0;
-                slots[cur_slot].tid = ev->value;
-            } else {
-                /* 抬手时还处于 pending = 它一直没怎么动 -> 当点击，拦掉 */
-                if (slots[cur_slot].pending) {
-                    logmsg("slot %d core tap at (%d,%d) major=%d -> BLOCKED core",
-                           cur_slot, slots[cur_slot].sx, slots[cur_slot].sy,
-                           slots[cur_slot].smajor);
-                    g_cancel = 1;      /* 用 CANCEL 抹掉这次点击 */
-                    slots[cur_slot].active = 0;
-                    slots[cur_slot].pending = 0;
-                    return;            /* 不要把 TRACKING_ID -1 发出去 */
-                }
-                slots[cur_slot].active = 0;
-                slots[cur_slot].have_x = 0;
-                slots[cur_slot].have_y = 0;
-                slots[cur_slot].undecided = 0;
-                slots[cur_slot].pending = 0;
-                slots[cur_slot].synth = 0;
-            }
-            break;
-        case ABS_MT_POSITION_X: slots[cur_slot].x = ev->value; slots[cur_slot].have_x = 1; break;
-        case ABS_MT_POSITION_Y: slots[cur_slot].y = ev->value; slots[cur_slot].have_y = 1; break;
-        case ABS_MT_TOUCH_MAJOR: slots[cur_slot].major = ev->value; break;
-        default:
-            /* ABS_X / ABS_Y / anything else the panel reports outside MT:
-             * forward untouched. */
-            add_pass(ev);
-            return;
-        }
-        slot = cur_slot;
-    } else if (ev->type == EV_KEY) {
-        if (ev->code == BTN_TOUCH || ev->code == BTN_TOOL_FINGER) btn = 1;
-        else {
-            /* KEY_WAKEUP (double-tap-to-wake), KEY_POWER, ... : never filter */
-            add_pass(ev);
-            return;
-        }
+    if (!filtered) {
+        for (int i = 0; i < frame_count; i++) out[n++] = frame[i].ev;
+        emitted_down = any_allowed_down();
     } else {
-        add_pass(ev);
-        return;
-    }
-
-    /* 核心带 pending 判定：动了就说明是手势，放行 */
-    if (slots[cur_slot].pending && slots[cur_slot].have_x && slots[cur_slot].have_y) {
-        int slop = (int)(core_slop * scale);
-        int dx = slots[cur_slot].x - slots[cur_slot].sx;
-        int dy = slots[cur_slot].y - slots[cur_slot].sy;
-        if (dx < 0) dx = -dx;
-        if (dy < 0) dy = -dy;
-        if (dx > slop || dy > slop) {
-            slots[cur_slot].pending = 0;
-            slots[cur_slot].blocked = 0;
-            logmsg("slot %d core swipe at (%d,%d) major=%d -> pass",
-                   cur_slot, slots[cur_slot].sx, slots[cur_slot].sy,
-                   slots[cur_slot].smajor);
+        for (int i = 0; i < frame_count; i++) {
+            if (frame[i].button || frame[i].slot == -2) continue;
+            if (frame[i].slot >= 0 && slots[frame[i].slot].blocked) continue;
+            out[n++] = frame[i].ev;
+        }
+        int down = any_allowed_down();
+        if (down != emitted_down) {
+            if (has_btn_touch)
+                add_button(out, &n, syn, BTN_TOUCH, down);
+            if (has_tool_finger)
+                add_button(out, &n, syn, BTN_TOOL_FINGER, down);
+            emitted_down = down;
         }
     }
+    out[n++] = *syn;
+    *out_count = n;
+    frame_count = 0;
+    return 0;
+}
 
-    if (frame_n < MAX_FRAME) {
-        frame[frame_n].ev = *ev;
-        frame[frame_n].slot = slot;
-        frame[frame_n].btn = btn;
-        frame[frame_n].pass = 0;
-        frame_n++;
+/* uinput writes must never silently discard a partial frame. */
+static int write_all(int fd, const void *data, size_t bytes)
+{
+    const char *p = data;
+    while (bytes) {
+        ssize_t n = write(fd, p, bytes);
+        if (n > 0) { p += n; bytes -= (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n == 0) errno = EIO;
+        return -1;
     }
+    return 0;
 }
 
 static int read_abs(int fd, int code, struct input_absinfo *ai)
@@ -456,156 +298,229 @@ static int read_abs(int fd, int code, struct input_absinfo *ai)
     return ioctl(fd, EVIOCGABS(code), ai);
 }
 
-static int has_abs(int fd, int code)
+/* Align both current-slot cursors at an empty-contact boundary. */
+static int align_current_slot(void)
 {
-    unsigned long bits[ABS_CNT / (8 * sizeof(long)) + 1];
-    memset(bits, 0, sizeof(bits));
-    if (ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(bits)), bits) < 0) return 0;
-    return (bits[code / (8 * sizeof(long))] >> (code % (8 * sizeof(long)))) & 1UL;
+    struct input_absinfo ai;
+    struct input_event events[2];
+    if (read_abs(src_fd, ABS_MT_SLOT, &ai) < 0 ||
+        ai.value < 0 || ai.value >= MAX_SLOTS) return -1;
+    cur_slot = ai.value;
+    memset(events, 0, sizeof(events));
+    events[0].type = EV_ABS;
+    events[0].code = ABS_MT_SLOT;
+    events[0].value = cur_slot;
+    events[1].type = EV_SYN;
+    events[1].code = SYN_REPORT;
+    return write_all(ui_fd, events, sizeof(events));
 }
 
-/* keep has_abs referenced even though copy_caps() uses the raw bitmap */
-__attribute__((unused)) static int (*const has_abs_ref)(int, int) = has_abs;
-
-/* copy the source device's whole capability set onto the virtual device,
- * so that non-touch events (KEY_WAKEUP double-tap gesture, ABS_X/ABS_Y ...)
- * survive the proxy hop. */
-static void copy_caps(void)
+static int source_touch_down(void)
 {
-    unsigned long kbits[KEY_CNT / (8 * sizeof(long)) + 1];
-    unsigned long abits[ABS_CNT / (8 * sizeof(long)) + 1];
-    int c;
+    unsigned long keys[NLONGS(KEY_CNT)];
+    memset(keys, 0, sizeof(keys));
+    if (ioctl(src_fd, EVIOCGKEY(sizeof(keys)), keys) < 0) return -1;
+    return BIT_TEST(keys, BTN_TOUCH) != 0;
+}
 
-    memset(kbits, 0, sizeof(kbits));
-    memset(abits, 0, sizeof(abits));
-    if (ioctl(src_fd, EVIOCGBIT(EV_KEY, sizeof(kbits)), kbits) < 0)
-        logmsg("EVIOCGBIT(EV_KEY) failed: %s", strerror(errno));
-    if (ioctl(src_fd, EVIOCGBIT(EV_ABS, sizeof(abits)), abits) < 0)
-        logmsg("EVIOCGBIT(EV_ABS) failed: %s", strerror(errno));
+static int copy_caps(void)
+{
+    unsigned long keys[NLONGS(KEY_CNT)], abs[NLONGS(ABS_CNT)], props[NLONGS(INPUT_PROP_CNT)];
+    memset(keys, 0, sizeof(keys));
+    memset(abs, 0, sizeof(abs));
+    memset(props, 0, sizeof(props));
 
-    for (c = 0; c < KEY_CNT; c++) {
-        if (!(kbits[c / (8 * sizeof(long))] & (1UL << (c % (8 * sizeof(long)))))) continue;
-        ioctl(ui_fd, UI_SET_KEYBIT, c);
-        n_keys++;
+    if (ioctl(src_fd, EVIOCGBIT(EV_KEY, sizeof(keys)), keys) < 0 ||
+        ioctl(src_fd, EVIOCGBIT(EV_ABS, sizeof(abs)), abs) < 0)
+        return -1;
+    if (ioctl(ui_fd, UI_SET_EVBIT, EV_SYN) < 0 ||
+        ioctl(ui_fd, UI_SET_EVBIT, EV_KEY) < 0 ||
+        ioctl(ui_fd, UI_SET_EVBIT, EV_ABS) < 0)
+        return -1;
+
+    for (int c = 0; c < KEY_CNT; c++) {
+        if (!BIT_TEST(keys, c)) continue;
+        if (ioctl(ui_fd, UI_SET_KEYBIT, c) < 0) return -1;
     }
-    for (c = 0; c < ABS_CNT; c++) {
+    for (int c = 0; c < ABS_CNT; c++) {
+        if (!BIT_TEST(abs, c)) continue;
         struct input_absinfo ai;
-        if (!(abits[c / (8 * sizeof(long))] & (1UL << (c % (8 * sizeof(long)))))) continue;
-        ioctl(ui_fd, UI_SET_ABSBIT, c);
-        n_abs++;
-        if (read_abs(src_fd, c, &ai) < 0) memset(&ai, 0, sizeof(ai));
+        if (read_abs(src_fd, c, &ai) < 0 || ioctl(ui_fd, UI_SET_ABSBIT, c) < 0)
+            return -1;
 #ifdef UI_ABS_SETUP
-        struct uinput_abs_setup uas;
-        memset(&uas, 0, sizeof(uas));
-        uas.code = c;
-        uas.absinfo = ai;
-        if (ioctl(ui_fd, UI_ABS_SETUP, &uas) < 0)
-            logmsg("UI_ABS_SETUP(%d) failed: %s", c, strerror(errno));
+        struct uinput_abs_setup setup;
+        memset(&setup, 0, sizeof(setup));
+        setup.code = c;
+        setup.absinfo = ai;
+        if (ioctl(ui_fd, UI_ABS_SETUP, &setup) < 0) return -1;
 #endif
     }
-    /* BTN_TOUCH / BTN_TOOL_FINGER must always exist even if the source omits them */
-    ioctl(ui_fd, UI_SET_KEYBIT, BTN_TOUCH);
-    ioctl(ui_fd, UI_SET_KEYBIT, BTN_TOOL_FINGER);
-}
-
-static int setup_uinput(const char *src_name, int bus, int vendor, int product, int version)
-{
-    struct uinput_setup usetup;
-
-    ui_fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
-    if (ui_fd < 0) { logmsg("open /dev/uinput failed: %s", strerror(errno)); return -1; }
-
-    ioctl(ui_fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(ui_fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(ui_fd, UI_SET_EVBIT, EV_SYN);
-    n_keys = n_abs = 0;
-    copy_caps();
-    ioctl(ui_fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT);
-
-    memset(&usetup, 0, sizeof(usetup));
-    snprintf(usetup.name, UINPUT_MAX_NAME_SIZE, "%s-filtered", src_name);
-    usetup.id.bustype = bus;
-    usetup.id.vendor = vendor;
-    usetup.id.product = product;
-    usetup.id.version = version;
-    if (ioctl(ui_fd, UI_DEV_SETUP, &usetup) < 0) { logmsg("UI_DEV_SETUP failed: %s", strerror(errno)); return -1; }
-    if (ioctl(ui_fd, UI_DEV_CREATE) < 0) { logmsg("UI_DEV_CREATE failed: %s", strerror(errno)); return -1; }
+    if (ioctl(src_fd, EVIOCGPROP(sizeof(props)), props) == 0) {
+        for (int c = 0; c < INPUT_PROP_CNT; c++)
+            if (BIT_TEST(props, c) && ioctl(ui_fd, UI_SET_PROPBIT, c) < 0) return -1;
+    }
+    if (ioctl(ui_fd, UI_SET_PROPBIT, INPUT_PROP_DIRECT) < 0) return -1;
+    has_btn_touch = BIT_TEST(keys, BTN_TOUCH);
+    has_tool_finger = BIT_TEST(keys, BTN_TOOL_FINGER);
     return 0;
 }
 
-static int find_device_by_name(const char *want, char *out, size_t outlen)
+static int setup_uinput(void)
 {
-    DIR *d = opendir("/dev/input");
-    if (!d) return -1;
-    struct dirent *de;
-    char path[256], name[128];
+    struct uinput_setup setup;
+    ui_fd = open("/dev/uinput", O_WRONLY | O_CLOEXEC);
+    if (ui_fd < 0) return -1;
+    if (copy_caps() < 0) return -1;
+
+    memset(&setup, 0, sizeof(setup));
+    snprintf(setup.name, sizeof(setup.name), "%s-filtered", device_name);
+    setup.id = device_id;
+    if (ioctl(ui_fd, UI_DEV_SETUP, &setup) < 0 || ioctl(ui_fd, UI_DEV_CREATE) < 0)
+        return -1;
+    return 0;
+}
+
+static int find_device(const char *wanted, char *path, size_t path_size)
+{
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return -1;
+    struct dirent *entry;
     int found = -1;
-    while ((de = readdir(d))) {
-        if (strncmp(de->d_name, "event", 5)) continue;
-        snprintf(path, sizeof(path), "/dev/input/%s", de->d_name);
+    while ((entry = readdir(dir))) {
+        if (strncmp(entry->d_name, "event", 5)) continue;
+        snprintf(path, path_size, "/dev/input/%s", entry->d_name);
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) continue;
-        memset(name, 0, sizeof(name));
-        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 && !strcmp(name, want)) {
-            snprintf(out, outlen, "%s", path);
+        char name[128] = {0};
+        if (ioctl(fd, EVIOCGNAME(sizeof(name)), name) >= 0 && !strcmp(name, wanted)) {
             found = 0;
             close(fd);
             break;
         }
         close(fd);
     }
-    closedir(d);
+    closedir(dir);
     return found;
 }
 
 static void write_info(void)
 {
-    FILE *f = fopen("/data/adb/edgefilter/info", "w");
+    const char *path = "/data/adb/edgefilter/info";
+    const char *tmp = "/data/adb/edgefilter/info.tmp";
+    FILE *f = fopen(tmp, "w");
     if (!f) return;
-    fprintf(f, "%d %d %d %s\n", max_x, max_y, rot * 90, g_name);
+    fprintf(f, "%d %d %d %s\n", max_x, max_y, rot * 90, device_name);
     fclose(f);
+    rename(tmp, path);
+}
+
+static void publish_ready(void)
+{
+    const char *path = "/data/adb/edgefilter/ready";
+    const char *tmp = "/data/adb/edgefilter/ready.tmp";
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fputs("1\n", f);
+    fclose(f);
+    rename(tmp, path);
 }
 
 static int detect_rotation(void)
 {
-    FILE *p = popen("dumpsys input 2>/dev/null | grep -m1 'Viewport INTERNAL'", "r");
+    FILE *p = popen("dumpsys input 2>/dev/null", "r");
     if (!p) return -1;
     char line[512];
-    int r = -1;
-    if (fgets(line, sizeof(line), p)) {
+    int result = -1;
+    while (fgets(line, sizeof(line), p)) {
+        if (!strstr(line, "Viewport INTERNAL")) continue;
         char *q = strstr(line, "orientation=");
         if (q) {
-            int v = atoi(q + 12);
-            if (v >= 0 && v <= 3) r = v;
+            int value = atoi(q + 12);
+            if (value >= 0 && value <= 3) result = value;
         }
+        break;
     }
     pclose(p);
-    return r;
+    return result;
+}
+
+/* dumpsys can take tens of milliseconds, so it never runs in the input loop. */
+static pid_t start_rotation_monitor(int *read_fd)
+{
+    int fds[2];
+    if (pipe(fds) < 0) return -1;
+    fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+    fcntl(fds[1], F_SETFD, FD_CLOEXEC);
+
+    pid_t pid = fork();
+    if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
+    if (pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        close(fds[0]);
+        if (src_fd >= 0) close(src_fd);
+        if (ui_fd >= 0) close(ui_fd);
+        if (lock_fd >= 0) close(lock_fd);
+        int last = rot;
+        for (;;) {
+            sleep(2);
+            int value = detect_rotation();
+            if (value < 0 || value == last) continue;
+            last = value;
+            unsigned char byte = (unsigned char)value;
+            if (write(fds[1], &byte, 1) != 1) _exit(0);
+        }
+    }
+    close(fds[1]);
+    *read_fd = fds[0];
+    return pid;
+}
+
+static void cleanup(void)
+{
+    if (monitor_pid > 0) {
+        kill(monitor_pid, SIGTERM);
+        waitpid(monitor_pid, NULL, 0);
+        monitor_pid = -1;
+    }
+    if (ui_fd >= 0) {
+        ioctl(ui_fd, UI_DEV_DESTROY);
+        close(ui_fd);
+        ui_fd = -1;
+    }
+    if (src_fd >= 0) {
+        ioctl(src_fd, EVIOCGRAB, 0);
+        close(src_fd);
+        src_fd = -1;
+    }
+    if (lock_fd >= 0) {
+        unlink("/data/adb/edgefilter/ready");
+        close(lock_fd);
+        lock_fd = -1;
+    }
 }
 
 static void usage(void)
 {
     fprintf(stderr,
-        "usage: edgefilter [-d DEV | --name NAME] [--left N] [--right N] [--top N] [--bottom N]\n"
-        "                  [--core-left N] [--core-right N] [--core-top N] [--core-bottom N]\n"
-        "                  [--scale F] [--rot auto|0|90|180|270] [--major N]\n"
-        "                  [-v] [--dry-run] [--info]\n"
-        "  bands are in logical screen px; --scale converts to raw units (default 10)\n"
-        "  --left/--right/--top/--bottom : outer band, only contacts with area >= --major\n"
-        "  --core-* : inner band nested inside the outer one\n"
-        "  --core-slop N : 核心带内移动超过 N px 视为手势放行（0 = 一律拦截）\n"
-        "  --major  : ABS_MT_TOUCH_MAJOR threshold for the outer band (0 = block all)\n"
-        "             实测：指尖 12~36，拇指贴边握持 40~76\n");
+        "usage: edgefilter [--name NAME|-d DEV] [--left N] [--right N]\n"
+        "                  [--top N] [--bottom N] [--major N] [--scale F]\n"
+        "                  [--rot auto|0|90|180|270] [--info]\n"
+        "Complete contacts in an edge band with major >= --major are dropped.\n"
+        "Incomplete contacts pass unchanged; --major 0 drops every complete edge contact.\n");
 }
 
 int main(int argc, char **argv)
 {
     const char *dev = NULL, *name = "goodix_ts";
-    char devpath[256] = {0};
-    char src_name[UINPUT_MAX_NAME_SIZE] = {0};
-    struct input_id id;
-    struct input_absinfo aix, aiy;
-    int info_only = 0, rot_opt = -1;
+    char path[256] = {0};
+    int info_only = 0, rot_auto = 1, status = 1;
+
+    /* Drop descriptors inherited from the launcher. ctl.sh runs under a file
+     * lock, and leaking that descriptor into this long-lived process would
+     * keep the lock held forever. */
+    for (int fd = 3; fd < 256; fd++) close(fd);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-d") && i + 1 < argc) dev = argv[++i];
@@ -614,170 +529,174 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--right") && i + 1 < argc) band_r = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top") && i + 1 < argc) band_t = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bottom") && i + 1 < argc) band_b = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--core-left") && i + 1 < argc) core_l = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--core-right") && i + 1 < argc) core_r = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--core-top") && i + 1 < argc) core_t = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--core-bottom") && i + 1 < argc) core_b = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--core-slop") && i + 1 < argc) core_slop = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
         else if (!strcmp(argv[i], "--major") && i + 1 < argc) major_min = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--scale") && i + 1 < argc) scale = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--info")) info_only = 1;
         else if (!strcmp(argv[i], "--rot") && i + 1 < argc) {
             const char *v = argv[++i];
-            if (!strcmp(v, "auto")) rot_opt = -1;
-            else rot_opt = atoi(v) / 90;
-        }
-        else if (!strcmp(argv[i], "-v")) verbose = 1;
-        else if (!strcmp(argv[i], "--dry-run")) dry_run = 1;
-        else if (!strcmp(argv[i], "--info")) info_only = 1;
-        else { usage(); return 2; }
+            if (strcmp(v, "auto")) { rot = atoi(v) / 90; rot_auto = 0; }
+        } else { usage(); return 2; }
+    }
+    if (band_l < 0 || band_r < 0 || band_t < 0 || band_b < 0 ||
+        major_min < 0 || scale <= 0 || rot < 0 || rot > 3) {
+        usage();
+        return 2;
     }
 
+    lock_fd = open("/data/adb/edgefilter/daemon.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd >= 0 && flock(lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        close(lock_fd);
+        lock_fd = -1;
+    }
+    if (lock_fd < 0) {
+        logmsg("another edgefilter instance is already active");
+        goto out;
+    }
+    unlink("/data/adb/edgefilter/ready");
+
     if (!dev) {
-        if (find_device_by_name(name, devpath, sizeof(devpath)) < 0) {
+        if (find_device(name, path, sizeof(path)) < 0) {
             logmsg("no input device named '%s'", name);
             return 1;
         }
-        dev = devpath;
+        dev = path;
     }
-
     src_fd = open(dev, O_RDONLY | O_CLOEXEC);
     if (src_fd < 0) { logmsg("open %s failed: %s", dev, strerror(errno)); return 1; }
+    if (ioctl(src_fd, EVIOCGNAME(sizeof(device_name)), device_name) < 0 ||
+        ioctl(src_fd, EVIOCGID, &device_id) < 0) {
+        logmsg("cannot read source identity: %s", strerror(errno));
+        goto out;
+    }
 
-    ioctl(src_fd, EVIOCGNAME(sizeof(src_name)), src_name);
-    ioctl(src_fd, EVIOCGID, &id);
-    g_bus = id.bustype; g_vendor = id.vendor; g_product = id.product; g_version = id.version;
-    snprintf(g_name, sizeof(g_name), "%s", src_name);
+    struct input_absinfo aix = {0}, aiy = {0}, ais = {0};
     if (read_abs(src_fd, ABS_MT_POSITION_X, &aix) < 0 ||
-        read_abs(src_fd, ABS_MT_POSITION_Y, &aiy) < 0) {
-        logmsg("%s has no ABS_MT_POSITION_X/Y", dev);
-        return 1;
+        read_abs(src_fd, ABS_MT_POSITION_Y, &aiy) < 0 ||
+        read_abs(src_fd, ABS_MT_SLOT, &ais) < 0 || ais.maximum >= MAX_SLOTS) {
+        logmsg("unsupported MT device (slots=%d)", ais.maximum + 1);
+        goto out;
     }
     max_x = aix.maximum;
     max_y = aiy.maximum;
-
-    if (rot_opt >= 0) rot = rot_opt;
-    else {
-        int r = detect_rotation();
-        if (r >= 0) rot = r;
+    if (rot_auto) {
+        int value = detect_rotation();
+        if (value >= 0) rot = value;
     }
-
-    logmsg("source %s (%s) panel 0..%d x 0..%d  rot=%d  scale=%.1f",
-           dev, src_name, max_x, max_y, rot * 90, scale);
-    logmsg("bands L=%d R=%d T=%d B=%d px  core L=%d R=%d T=%d B=%d px  slop=%d  major_min=%d dry_run=%d",
-           band_l, band_r, band_t, band_b, core_l, core_r, core_t, core_b, core_slop, major_min, dry_run);
-
-    /* 给 api.sh 用的小文件，省得每次去 grep 整份日志 */
     write_info();
+    logmsg("source %s (%s) panel 0..%d x 0..%d rot=%d scale=%.1f",
+           dev, device_name, max_x, max_y, rot * 90, scale);
+    logmsg("bands L=%d R=%d T=%d B=%d px major_min=%d; incomplete=pass; persistent=uinput",
+           band_l, band_r, band_t, band_b, major_min);
+    if (info_only) { status = 0; goto out; }
 
-    if (info_only) return 0;
-
-    if (!dry_run) {
-        if (setup_uinput(src_name, id.bustype, id.vendor, id.product, id.version) < 0) return 1;
-        if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
-            logmsg("EVIOCGRAB failed: %s", strerror(errno));
-            return 1;
-        }
-        logmsg("grabbed %s, virtual device '%s-filtered' created (%d keys, %d abs)",
-               dev, src_name, n_keys, n_abs);
-        grabbed = 1;
+    for (int i = 0; i < MAX_SLOTS; i++) slots[i].decided = 1;
+    if (setup_uinput() < 0) {
+        logmsg("uinput setup failed: %s", strerror(errno));
+        goto out;
     }
+    usleep(100000);             /* let InputReader open the device before grabbing */
+    if (align_current_slot() < 0) {
+        logmsg("cannot align source/virtual slots: %s", strerror(errno));
+        goto out;
+    }
+    int native_down = source_touch_down();
+    if (native_down != 0) {
+        logmsg(native_down < 0 ? "cannot query native contacts: %s" :
+               "native contact is active; retry after all fingers lift%s",
+               native_down < 0 ? strerror(errno) : "");
+        goto out;
+    }
+    if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
+        logmsg("EVIOCGRAB failed: %s", strerror(errno));
+        goto out;
+    }
+    /* Close the query/grab race: a DOWN that began before grab is not ours. */
+    native_down = source_touch_down();
+    if (native_down != 0) {
+        logmsg("contact began during startup; native touch restored");
+        goto out;
+    }
+    publish_ready();
+    logmsg("grabbed %s; virtual device '%s-filtered' is persistent", dev, device_name);
 
-    signal(SIGINT, on_sig);
-    signal(SIGTERM, on_sig);
-    signal(SIGHUP, on_hup);
-    signal(SIGUSR1, on_usr1);
-    signal(SIGUSR2, on_usr2);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    /* The touch stream is persistent across screen state, so a stale watcher
+     * signalling this PID must not be able to stop filtering. */
+    signal(SIGHUP, SIG_IGN);
+    signal(SIGUSR1, SIG_IGN);
+    signal(SIGUSR2, SIG_IGN);
 
-    struct pollfd pfd = { .fd = src_fd, .events = POLLIN };
-    struct input_event buf[256];
+    int rotation_fd = -1;
+    if (rot_auto) monitor_pid = start_rotation_monitor(&rotation_fd);
+    struct pollfd pfds[2];
+    pfds[0].fd = src_fd;
+    pfds[0].events = POLLIN;
+    pfds[1].fd = rotation_fd;
+    pfds[1].events = POLLIN;
 
     while (!g_stop) {
-        if (g_off) {
-            /* Screen off: hand the panel back to Android untouched so that the
-             * double-tap-to-wake gesture, doze mode and the whole native
-             * gesture path work exactly as they would without us. */
-            g_off = 0;
-            if (grabbed) {
-                ioctl(src_fd, EVIOCGRAB, 0);
-                grabbed = 0;
-                logmsg("screen off: grab released (native gesture path)");
-            }
-            if (ui_fd >= 0) {
-                ioctl(ui_fd, UI_DEV_DESTROY);
-                close(ui_fd);
-                ui_fd = -1;
-                logmsg("screen off: virtual device removed");
-            }
-            reset_state();
+        int ready = poll(pfds, 2, -1);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            logmsg("poll failed: %s", strerror(errno));
+            goto out;
         }
-        if (g_rot) {
-            /* 旋转可能变了：重读一次，变了就更新 info 让 WebUI 也跟着变 */
-            g_rot = 0;
-            if (rot_opt < 0) {                 /* 只有 ROT=auto 才自动跟 */
-                int nr = detect_rotation();
-                if (nr >= 0 && nr != rot) {
-                    logmsg("rotation changed %d -> %d", rot * 90, nr * 90);
-                    rot = nr;
-                    write_info();
-                }
+        if (rotation_fd >= 0 && (pfds[1].revents & POLLIN)) {
+            unsigned char values[16];
+            ssize_t count = read(rotation_fd, values, sizeof(values));
+            if (count > 0 && values[count - 1] <= 3 && rot != values[count - 1]) {
+                rot = values[count - 1];
+                logmsg("rotation changed -> %d", rot * 90);
+                write_info();
             }
         }
-        if (g_on) {
-            g_on = 0;
-            reset_state();
-            if (rot_opt < 0) {
-                int nr = detect_rotation();
-                if (nr >= 0 && nr != rot) {
-                    logmsg("rotation changed %d -> %d", rot * 90, nr * 90);
-                    rot = nr;
-                    write_info();
-                }
-            }
-            if (ui_fd < 0 && setup_uinput(g_name, g_bus, g_vendor, g_product, g_version) < 0)
-                logmsg("screen on: creating virtual device failed");
-            if (!grabbed) {
-                if (ioctl(src_fd, EVIOCGRAB, 1) < 0)
-                    logmsg("screen on: EVIOCGRAB failed: %s", strerror(errno));
-                else {
-                    grabbed = 1;
-                    logmsg("screen on: grabbed (%d keys, %d abs)", n_keys, n_abs);
-                }
-            } else {
-                logmsg("screen on: contact state reset");
-            }
+        if (rotation_fd >= 0 && (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+            close(rotation_fd);
+            rotation_fd = pfds[1].fd = -1;
         }
-        if (ui_dead) {
-            ui_dead = 0;
-            logmsg("uinput device lost, recreating");
-            reset_state();
-            if (ui_fd >= 0) { ioctl(ui_fd, UI_DEV_DESTROY); close(ui_fd); ui_fd = -1; }
-            if (setup_uinput(g_name, g_bus, g_vendor, g_product, g_version) < 0) {
-                /* never leave the panel grabbed without a working sink */
-                logmsg("recreate failed -> releasing grab, native touch restored");
-                ioctl(src_fd, EVIOCGRAB, 0);
-                grabbed = 0;
-                break;
+        if (!(pfds[0].revents & POLLIN)) {
+            if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                logmsg("source device disappeared; disabling filter");
+                goto out;
             }
-            logmsg("uinput recreated (%d keys, %d abs)", n_keys, n_abs);
+            continue;
         }
-        int pr = poll(&pfd, 1, 500);
-        if (pr < 0) { if (errno == EINTR) continue; break; }
-        if (pr == 0) continue;
-        ssize_t r = read(src_fd, buf, sizeof(buf));
-        if (r <= 0) {
-            if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-            logmsg("read failed: %s", strerror(errno));
-            break;
-        }
-        /* while ungrabbed Android is reading the same events natively:
-         * forwarding them would duplicate every touch, so drop them. */
-        if (!grabbed) continue;
-        int n = (int)(r / (ssize_t)sizeof(struct input_event));
-        for (int i = 0; i < n; i++) handle_event(&buf[i]);
-    }
 
-    logmsg("exiting");
-    if (ui_fd >= 0) { ioctl(ui_fd, UI_DEV_DESTROY); close(ui_fd); }
-    if (src_fd >= 0) { ioctl(src_fd, EVIOCGRAB, 0); close(src_fd); }
-    return 0;
+        struct input_event input[256];
+        ssize_t bytes = read(src_fd, input, sizeof(input));
+        if (bytes <= 0) {
+            if (bytes < 0 && errno == EINTR) continue;
+            logmsg("source read failed: %s", bytes < 0 ? strerror(errno) : "EOF");
+            goto out;
+        }
+        if (bytes % (ssize_t)sizeof(struct input_event)) {
+            logmsg("partial input_event read; disabling filter");
+            goto out;
+        }
+        int count = (int)(bytes / (ssize_t)sizeof(struct input_event));
+        for (int i = 0; i < count; i++) {
+            if (input[i].type == EV_SYN && input[i].code == SYN_REPORT) {
+                struct input_event output[OUT_CAP];
+                int output_count = 0;
+                finish_frame(&input[i], output, &output_count);
+                if (write_all(ui_fd, output, (size_t)output_count * sizeof(output[0])) < 0) {
+                    logmsg("uinput write failed: %s; native touch restored", strerror(errno));
+                    goto out;
+                }
+            } else if (handle_event(&input[i]) < 0) {
+                goto out;
+            }
+        }
+    }
+    status = 0;
+
+out:
+    logmsg("exiting; native touch restored");
+    cleanup();
+    return status;
 }
