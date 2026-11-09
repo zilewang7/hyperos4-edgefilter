@@ -96,6 +96,9 @@ static int new_slots[MAX_SLOTS], new_count;
 static struct fev frame[MAX_FRAME];
 static int frame_count, cur_slot, frame_start_slot;
 static int emitted_down;
+static int grabbed;
+static int screen_awake = 1;
+static unsigned long stat_frames, stat_events, stat_wakeups;
 
 static void logmsg(const char *fmt, ...)
 {
@@ -205,6 +208,12 @@ static int handle_event(const struct input_event *ev)
 
     if (ev->type == EV_KEY) {
         int button = (ev->code == BTN_TOUCH || ev->code == BTN_TOOL_FINGER);
+        if (ev->code == KEY_WAKEUP || ev->code == KEY_POWER) {
+            stat_wakeups++;
+            logmsg("panel key %s=%d (screen %s)",
+                   ev->code == KEY_WAKEUP ? "KEY_WAKEUP" : "KEY_POWER",
+                   ev->value, screen_awake ? "on" : "off");
+        }
         return add_event(ev, -1, button ? ACT_PENDING : ACT_FORWARD, button);
     }
 
@@ -625,6 +634,21 @@ static int detect_rotation(void)
     return result;
 }
 
+/* Returns 1 awake, 0 asleep, -1 unknown. */
+static int detect_screen_awake(void)
+{
+    FILE *p = popen("dumpsys power 2>/dev/null", "r");
+    if (!p) return -1;
+    char line[256];
+    int awake = -1;
+    while (fgets(line, sizeof(line), p)) {
+        if (!strcmp(line, "  mWakefulness=Awake\n")) { awake = 1; break; }
+        if (!strncmp(line, "  mWakefulness=", 15)) { awake = 0; break; }
+    }
+    pclose(p);
+    return awake;
+}
+
 /* dumpsys can take tens of milliseconds, so it never runs in the input loop. */
 static pid_t start_rotation_monitor(int *read_fd)
 {
@@ -643,19 +667,79 @@ static pid_t start_rotation_monitor(int *read_fd)
         if (src_fd >= 0) close(src_fd);
         if (ui_fd >= 0) close(ui_fd);
         if (lock_fd >= 0) close(lock_fd);
-        int last = rot;
+        int last_rot = rot;
+        unsigned char msg[2];
         for (;;) {
             sleep(2);
-            int value = detect_rotation();
-            if (value < 0 || value == last) continue;
-            last = value;
-            unsigned char byte = (unsigned char)value;
-            if (write(fds[1], &byte, 1) != 1) _exit(0);
+            int r = detect_rotation();
+            if (r >= 0 && r != last_rot) {
+                last_rot = r;
+                msg[0] = 'R'; msg[1] = (unsigned char)r;
+                if (write(fds[1], msg, 2) != 2) _exit(0);
+            }
+            int a = detect_screen_awake();
+            if (a >= 0) {
+                msg[0] = 'S'; msg[1] = (unsigned char)a;
+                if (write(fds[1], msg, 2) != 2) _exit(0);
+            }
         }
     }
     close(fds[1]);
     *read_fd = fds[0];
     return pid;
+}
+
+/* Lift every contact the virtual device still holds. */
+static int release_all(void)
+{
+    struct input_event out[MAX_SLOTS * 2 + 4];
+    int n = 0, any = 0;
+    struct input_event stamp;
+    struct timespec ts;
+    memset(&stamp, 0, sizeof(stamp));
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    stamp.time.tv_sec = ts.tv_sec;
+    stamp.time.tv_usec = (suseconds_t)(ts.tv_nsec / 1000);
+
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        if (slots[i].state != ST_PASS) continue;
+        out[n++] = mkabs(&stamp, ABS_MT_SLOT, i);
+        out[n++] = mkabs(&stamp, ABS_MT_TRACKING_ID, -1);
+        slots[i].state = ST_EMPTY;
+        any = 1;
+    }
+    if (emitted_down) {
+        if (has_btn_touch) out[n++] = mkkey(&stamp, BTN_TOUCH, 0);
+        if (has_tool_finger) out[n++] = mkkey(&stamp, BTN_TOOL_FINGER, 0);
+        emitted_down = 0;
+        any = 1;
+    }
+    if (!any) return 0;
+    memset(&out[n], 0, sizeof(out[0]));
+    out[n].time = stamp.time;
+    n++;
+    return write_all(ui_fd, out, (size_t)n * sizeof(out[0]));
+}
+
+/* Discard whatever queued up while the device was not grabbed. */
+static void drain_source(void)
+{
+    int flags = fcntl(src_fd, F_GETFL, 0);
+    if (flags < 0) return;
+    fcntl(src_fd, F_SETFL, flags | O_NONBLOCK);
+    struct input_event tmp[256];
+    while (read(src_fd, tmp, sizeof(tmp)) > 0) { }
+    fcntl(src_fd, F_SETFL, flags);
+}
+
+static void reset_contacts(void)
+{
+    for (int i = 0; i < MAX_SLOTS; i++) {
+        memset(&slots[i], 0, sizeof(slots[i]));
+        slots[i].state = ST_EMPTY;
+    }
+    new_count = frame_count = 0;
+    emitted_down = 0;
 }
 
 static void cleanup(void)
@@ -792,25 +876,32 @@ int main(int argc, char **argv)
         logmsg("cannot align source/virtual slots: %s", strerror(errno));
         goto out;
     }
-    int native_down = source_touch_down();
-    if (native_down != 0) {
-        logmsg(native_down < 0 ? "cannot query native contacts: %s" :
-               "native contact is active; retry after all fingers lift%s",
-               native_down < 0 ? strerror(errno) : "");
-        goto out;
-    }
-    if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
-        logmsg("EVIOCGRAB failed: %s", strerror(errno));
-        goto out;
-    }
-    /* Close the query/grab race: a DOWN that began before grab is not ours. */
-    native_down = source_touch_down();
-    if (native_down != 0) {
-        logmsg("contact began during startup; native touch restored");
-        goto out;
+    int awake = detect_screen_awake();
+    if (awake >= 0) screen_awake = awake;
+    if (screen_awake) {
+        int native_down = source_touch_down();
+        if (native_down != 0) {
+            logmsg(native_down < 0 ? "cannot query native contacts: %s" :
+                   "native contact is active; retry after all fingers lift%s",
+                   native_down < 0 ? strerror(errno) : "");
+            goto out;
+        }
+        if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
+            logmsg("EVIOCGRAB failed: %s", strerror(errno));
+            goto out;
+        }
+        /* Close the query/grab race: a DOWN that began before grab is not ours. */
+        native_down = source_touch_down();
+        if (native_down != 0) {
+            logmsg("contact began during startup; native touch restored");
+            goto out;
+        }
+        grabbed = 1;
+        logmsg("grabbed %s; virtual device '%s-filtered' is persistent", dev, device_name);
+    } else {
+        logmsg("screen is off; the panel stays native until it wakes");
     }
     publish_ready();
-    logmsg("grabbed %s; virtual device '%s-filtered' is persistent", dev, device_name);
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -825,27 +916,72 @@ int main(int argc, char **argv)
     signal(SIGUSR2, SIG_IGN);
 
     int rotation_fd = -1;
-    if (rot_auto) monitor_pid = start_rotation_monitor(&rotation_fd);
+    monitor_pid = start_rotation_monitor(&rotation_fd);
+    if (monitor_pid < 0)
+        logmsg("monitor unavailable; screen-off handover disabled");
     struct pollfd pfds[2];
     pfds[0].fd = src_fd;
     pfds[0].events = POLLIN;
     pfds[1].fd = rotation_fd;
     pfds[1].events = POLLIN;
 
+    unsigned long hb_frames = 0, hb_events = 0, hb_wakeups = 0;
+    long long hb_last = now_ms();
     while (!g_stop) {
-        int ready = poll(pfds, 2, -1);
+        int ready = poll(pfds, 2, 1000);
         if (ready < 0) {
             if (errno == EINTR) continue;
             logmsg("poll failed: %s", strerror(errno));
             goto out;
         }
+        if (now_ms() - hb_last >= 10000) {
+            hb_last = now_ms();
+            if (stat_frames != hb_frames || stat_events != hb_events ||
+                stat_wakeups != hb_wakeups) {
+                logmsg("hb frames=%lu events=%lu wakekeys=%lu grabbed=%d screen=%s",
+                       stat_frames, stat_events, stat_wakeups, grabbed,
+                       screen_awake ? "on" : "off");
+                hb_frames = stat_frames;
+                hb_events = stat_events;
+                hb_wakeups = stat_wakeups;
+            }
+        }
         if (rotation_fd >= 0 && (pfds[1].revents & POLLIN)) {
-            unsigned char values[16];
-            ssize_t count = read(rotation_fd, values, sizeof(values));
-            if (count > 0 && values[count - 1] <= 3 && rot != values[count - 1]) {
-                rot = values[count - 1];
-                logmsg("rotation changed -> %d", rot * 90);
-                write_info();
+            unsigned char msg[16];
+            ssize_t count = read(rotation_fd, msg, sizeof(msg));
+            for (ssize_t k = 0; k + 1 < count; k += 2) {
+                int value = msg[k + 1];
+                if (msg[k] == 'R' && rot_auto && value <= 3 && rot != value) {
+                    rot = value;
+                    logmsg("rotation changed -> %d", rot * 90);
+                    write_info();
+                } else if (msg[k] == 'S' && value <= 1) {
+                    screen_awake = value;
+                    if (!screen_awake) {
+                        if (!grabbed) continue;
+                        /* Hand the panel back while it is off. MIUI's own touch
+                         * consumers (touchfeature-service, toucheventcheck) keep
+                         * the panel mode state machine in sync, and starving
+                         * them leaves it stuck in gesture mode. */
+                        release_all();
+                        ioctl(src_fd, EVIOCGRAB, 0);
+                        grabbed = 0;
+                        reset_contacts();
+                        logmsg("screen off: grab released, panel handed back");
+                    } else if (!grabbed) {
+                        /* Never capture a gesture that already started natively. */
+                        int busy = source_touch_down();
+                        if (busy != 0) continue;
+                        drain_source();
+                        if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
+                            logmsg("screen on: EVIOCGRAB failed: %s", strerror(errno));
+                            continue;
+                        }
+                        grabbed = 1;
+                        reset_contacts();
+                        logmsg("screen on: grabbed again");
+                    }
+                }
             }
         }
         if (rotation_fd >= 0 && (pfds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
@@ -872,8 +1008,10 @@ int main(int argc, char **argv)
             goto out;
         }
         int count = (int)(bytes / (ssize_t)sizeof(struct input_event));
+        stat_events += (unsigned long)count;
         for (int i = 0; i < count; i++) {
             if (input[i].type == EV_SYN && input[i].code == SYN_REPORT) {
+                stat_frames++;
                 struct input_event output[OUT_CAP];
                 int output_count = 0;
                 finish_frame(&input[i], output, &output_count);

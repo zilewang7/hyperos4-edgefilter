@@ -142,5 +142,6 @@ case "$action" in
     set) set_cfg ;;
     start) "$CTL" start >/dev/null 2>&1; status_json ;;
     stop) "$CTL" stop >/dev/null 2>&1; status_json ;;
+    heal) "$CTL" heal >/dev/null 2>&1; status_json ;;
     *) printf '{"ok":false,"error":"unknown action"}' ;;
 esac

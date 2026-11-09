@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# edgefilter 控制脚本: start | stop | restart | status | log
+# edgefilter 控制脚本: start | stop | restart | heal | status | log
 MODDIR=$(cd "$(dirname "$0")" && pwd)
 DATA=/data/adb/edgefilter
 CFG=$DATA/config
@@ -91,11 +91,13 @@ case "$1" in
     start)   do_start ;;
     stop)    do_stop ;;
     restart) do_stop; sleep 0.2; do_start ;;
+    # 面板卡在手势模式时，交回 event5 几秒比任何重抓都有效
+    heal)    do_stop; sleep 3; do_start ;;
     status)
         if is_ready; then echo "running (pid $(read_pid), ready)"
         elif is_running; then echo "starting (pid $(read_pid), not ready)"
         else echo "stopped"; fi
         ;;
     log) tail -n "${2:-30}" "$LOG" ;;
-    *) echo "usage: $0 {start|stop|restart|status|log [n]}"; exit 2 ;;
+    *) echo "usage: $0 {start|stop|restart|heal|status|log [n]}"; exit 2 ;;
 esac

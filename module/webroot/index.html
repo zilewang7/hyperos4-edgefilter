@@ -66,7 +66,7 @@
       <div class="row"><label>扣住上限</label><span class="val"><span id="vCH">200</span> ms</span></div><input type="range" id="sCH" min="0" max="600" step="20" value="200">
       <div class="hint" id="chint"></div>
     </div>
-    <div class="btns"><button class="primary" id="apply">应用并重启</button><button id="reset">还原</button><button id="stop">停止</button><button id="start">启动</button></div>
+    <div class="btns"><button class="primary" id="apply">应用并重启</button><button id="reset">还原</button><button id="stop">停止</button><button id="start">启动</button><button id="heal">重置面板</button></div>
     <div class="hint" id="dirty" style="display:none;color:var(--warn)">有未应用的改动</div>
   </section>
   <section class="card" style="grid-column:1/-1">
@@ -164,6 +164,7 @@ $('apply').onclick=()=>{const c=cfgVals();request({action:'set',left:c.L,right:c
   coreLeft:c.CL,coreRight:c.CR,coreTop:c.CT,coreBottom:c.CB,coreSlop:c.CS,coreHold:c.CH},()=>{setDirty(false);toast('已应用');});};
 $('stop').onclick=()=>request({action:'stop'},()=>toast('已停止，触控已回原生'));
 $('start').onclick=()=>request({action:'start'},()=>toast('已启动'));
+$('heal').onclick=()=>request({action:'heal'},()=>toast('已重置面板'));
 $('modepill').textContent=KSU?'KSU 直连':'HTTP';resize();scheduleDraw();window.addEventListener('resize',()=>{resize();scheduleDraw();});
 checkMajor();checkCore();pollStatus();setInterval(pollStatus,2000);setInterval(pollEvents,700);
 </script>

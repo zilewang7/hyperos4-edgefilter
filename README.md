@@ -76,13 +76,27 @@ goodix_ts (event5)
 启动时还会检查原生触点状态：**如果手指正按着，拒绝启动并保持原生触控**，等抬起后再启动。
 `EVIOCGRAB` 不会替其他客户端取消已经收到的 `DOWN`，从半段手势开始转发会造成残留。
 
-### 为什么不再处理亮灭屏
+### 亮灭屏：只交还 grab，不拆设备
 
-虚拟设备在亮灭屏之间**保持不变**，也不释放 grab。源设备的全部按键能力（包括双击唤醒的
-`KEY_WAKEUP`、`KEY_POWER`）都复制并原样透传。
+虚拟设备**始终存在**，不销毁也不重建 —— 反复拆装输入设备会扰动 InputReader 与触摸 IC。
 
-v0.8 在息屏时释放 grab、销毁 uinput，亮屏时重建。反复拆装输入设备会扰动
-InputReader 与触摸 IC 的模式状态，是「亮屏后触摸无响应」的可疑来源之一。
+但 `EVIOCGRAB` 是排他的，而 MIUI 自己有四个进程在读 `event5`：
+
+| 进程 | 作用 |
+|---|---|
+| `system_server` | InputReader（本模块就是要替代它） |
+| `vendor.xiaomi.hw.touchfeature-service` | 面板模式与 doze 状态机 |
+| `toucheventcheck` | 小米防误触检查 |
+| `surfaceflinger` | 触控→显示管线 |
+
+我们一抓，后三个就永久收不到触点事件。**面板从「手势模式」切回正常模式依赖这条链路**，
+长期饿着它们会让面板卡在手势模式：屏幕亮着、触摸无响应、双击也唤不醒。
+
+所以 v0.11 起：**灭屏期间释放 grab**，把面板完整交还给 MIUI；**亮屏后再抓回**，
+并且只在源触点全部抬起后才抓（绝不从半段手势开始接管）。抓回最多延迟 2 秒
+（看护进程的轮询周期），这段时间触控走原生、不丢事件。
+
+v0.8 也曾在息屏释放 grab，但它同时销毁/重建 uinput，那个抖动才是当时的问题。
 
 ## 两层边缘带
 
@@ -144,8 +158,8 @@ InputReader 与触摸 IC 的模式状态，是「亮屏后触摸无响应」的�
 命令行装法：
 
 ```bash
-adb push edgefilter-v0.10.1.zip /data/local/tmp/
-adb shell 'su -c "ksud module install /data/local/tmp/edgefilter-v0.10.1.zip"'
+adb push edgefilter-v0.11.zip /data/local/tmp/
+adb shell 'su -c "ksud module install /data/local/tmp/edgefilter-v0.11.zip"'
 ```
 
 > **免解锁越狱（CVE 临时 root）注意**：KSU 的 `service.sh` 只在开机阶段执行，
@@ -210,6 +224,32 @@ daemon 自己 fork 一个子进程每 2 秒读一次 `dumpsys input` 的 `Viewpo
 值真的变了才通过管道通知主循环。`dumpsys` 一次约 45ms，放在独立进程里，
 不占用触控事件循环。主进程退出时子进程通过 `PR_SET_PDEATHSIG` 一起退出。
 
+## 自检与恢复
+
+daemon 每 10 秒在有活动时输出一行心跳：
+
+```
+[edgefilter] hb frames=897 events=2361 wakekeys=4 grabbed=1 screen=on
+```
+
+`frames` / `events` 停止增长而 `screen=on`，说明面板没有在发事件；`grabbed=0` 说明当前没有过滤。
+面板按键也会单独记录：
+
+```
+[edgefilter] panel key KEY_WAKEUP=1 (screen off)
+```
+
+`KEY_WAKEUP` 在 `screen off` 时出现是正常的（双击唤醒走的就是它）。
+
+### 面板卡住时
+
+```bash
+su -c /data/adb/modules/edgefilter/ctl.sh heal
+```
+
+等价于「停掉、等 3 秒、重新启动」—— 把 `event5` 交还 MIUI 几秒，比任何重抓都有效。
+WebUI 上的「重置面板」按钮是同一个动作。
+
 ## 排查
 
 **边缘手势（侧滑返回 / 上滑回桌面）不灵**
@@ -256,6 +296,9 @@ su -c /data/adb/modules/edgefilter/ctl.sh restart
 - 核心带内的滑动起手会晚 1~2 帧（约 8~16ms）。
 - 核心带内的长按会在 `CORE_HOLD_MS` 后放行，不是从按下那一刻算起。
 - 如果面板在手指静止时完全不发帧，核心带内的长按会一直扣到抬手（表现为长按无效）。
+- `EVIOCGRAB` 会让 MIUI 自带的 `touchfeature-service`、`toucheventcheck`、
+  `surfaceflinger` 读不到触点。这是用户态过滤的固有限制，已在亮灭屏时尽量交还，
+  但仍可能偶发面板模式失步。卡住时用 `ctl.sh heal` 恢复。
 
 ## 从源码构建
 
